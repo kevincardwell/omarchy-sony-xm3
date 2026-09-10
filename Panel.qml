@@ -2,8 +2,6 @@
 // Omarchy Bar-Widget & Interactive Dropdown Control Panel for Sony WH-1000XM3.
 import QtQuick
 import QtQuick.Controls
-import QtQuick.Layouts
-import Quickshell
 import Quickshell.Io
 import qs.Commons
 import qs.Ui
@@ -17,7 +15,6 @@ Panel {
 
   readonly property color foreground: bar ? bar.foreground : Color.foreground
   readonly property color urgent: bar ? bar.urgent : Color.urgent
-  readonly property color barForeground: bar ? bar.barForeground : Color.foreground
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
 
   // Keyboard navigation state
