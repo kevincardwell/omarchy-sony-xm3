@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "connected": true,
+  "device_name": "WH-1000XM3",
+  "battery_level": 92,
+  "charging": true,
+  "battery_charging": true,
+  "noise_mode": "anc",
+  "ambient_level": 0,
+  "ambient_sound_level": 0,
+  "ambient_max_level": 19,
+  "voice_passthrough": false,
+  "eq_preset": "vocal",
+  "eq_bands": [
+    0,
+    0,
+    0,
+    0,
+    0
+  ],
+  "eq_custom_bands": [
+    0,
+    0,
+    0,
+    0,
+    0
+  ],
+  "clear_bass": 1,
+  "dsee": false,
+  "dsee_hx": false,
+  "ear_detection": true,
+  "surround": "off",
+  "sound_position": "off",
+  "auto_power_off": "off",
+  "connection_mode": "quality",
+  "codec": "AAC",
+  "last_updated": 1757462400
+}

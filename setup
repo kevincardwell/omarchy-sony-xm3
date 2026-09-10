@@ -1,0 +1,265 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# setup — Packaging, Build & Installation Script for omarchy-sony-xm3
+# Project: omarchy-sony-xm3 (Sony WH-1000XM3 Plugin & Headless Bluetooth Daemon)
+# ==============================================================================
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Colors for terminal output
+BOLD='\033[1m'
+GREEN='\033[0;32m'
+BLUE='\033[0;34m'
+YELLOW='\033[1;33m'
+RED='\033[0;31m'
+NC='\033[0m' # No Color
+
+info() {
+  printf "${BLUE}${BOLD}[INFO]${NC} %s\n" "$*"
+}
+
+success() {
+  printf "${GREEN}${BOLD}[SUCCESS]${NC} %s\n" "$*"
+}
+
+warn() {
+  printf "${YELLOW}${BOLD}[WARN]${NC} %s\n" "$*"
+}
+
+error() {
+  printf "${RED}${BOLD}[ERROR]${NC} %s\n" "$*" >&2
+}
+
+print_help() {
+  cat << 'HELP_EOF'
+Usage: setup [OPTIONS]
+
+Set up omarchy-sony-xm3: verify/install build dependencies, compile binaries,
+install binaries to ~/.local/bin, install and enable the systemd user service,
+and deploy the Omarchy bar-widget plugin.
+
+Options:
+  -h, --help    Display this help message and exit 0
+
+Steps performed:
+  1. Detect Arch Linux (ID_LIKE=arch or /etc/arch-release) and check for
+     required packages: bluez-libs (or bluez), dbus, cmake, ninja, gcc/clang.
+     Install missing packages via omarchy pkg add or sudo pacman -S.
+  1b. Warn if this machine has no Bluetooth adapter, if bluetooth.service is
+     stopped, or if no WH-1000XM3 is paired. These are warnings, not errors.
+  2. Configure and build daemon and CLI using CMake and Ninja:
+     cmake -B build -G Ninja && cmake --build build
+  3. Install sony-xm3-daemon and sony-xm3-ctl into ~/.local/bin (mode 0755).
+  4. Copy daemon/sony-xm3.service to ~/.config/systemd/user/,
+     reload systemd daemon, and enable the service unit.
+  5. Deploy plugin/ to ~/.local/share/omarchy/shell/plugins/io.github.kevincardwell.omasonyxm3,
+     verify no symlinks exist, and validate via omarchy-plugin-validate if present.
+HELP_EOF
+}
+
+# Handle command line flags
+for arg in "$@"; do
+  case "$arg" in
+    -h|--help)
+      print_help
+      exit 0
+      ;;
+    *)
+      error "Unknown option: $arg"
+      echo ""
+      print_help
+      exit 1
+      ;;
+  esac
+done
+
+is_arch_linux() {
+  if [[ -f /etc/arch-release ]]; then
+    return 0
+  fi
+  if [[ -f /etc/os-release ]] && grep -qE '^ID(_LIKE)?=.*arch' /etc/os-release; then
+    return 0
+  fi
+  return 1
+}
+
+check_and_install_dependencies() {
+  info "Checking system dependencies..."
+  if ! is_arch_linux; then
+    info "Non-Arch distribution detected; skipping pacman dependency checks."
+    return 0
+  fi
+
+  local missing_pkgs=()
+
+  # Check bluez-libs or bluez
+  if ! pacman -Q bluez-libs >/dev/null 2>&1 && ! pacman -Q bluez >/dev/null 2>&1; then
+    missing_pkgs+=("bluez-libs")
+  fi
+
+  # Check dbus
+  if ! pacman -Q dbus >/dev/null 2>&1; then
+    missing_pkgs+=("dbus")
+  fi
+
+  # Check cmake (check pacman or command in PATH)
+  if ! pacman -Q cmake >/dev/null 2>&1 && ! command -v cmake >/dev/null 2>&1; then
+    missing_pkgs+=("cmake")
+  fi
+
+  # Check ninja (check pacman or command in PATH)
+  if ! pacman -Q ninja >/dev/null 2>&1 && ! command -v ninja >/dev/null 2>&1; then
+    missing_pkgs+=("ninja")
+  fi
+
+  # Check gcc or clang (check pacman or command in PATH)
+  if ! pacman -Q gcc >/dev/null 2>&1 && ! pacman -Q clang >/dev/null 2>&1 && \
+     ! command -v gcc >/dev/null 2>&1 && ! command -v clang >/dev/null 2>&1; then
+    missing_pkgs+=("gcc")
+  fi
+
+  if [[ ${#missing_pkgs[@]} -gt 0 ]]; then
+    info "Missing dependencies detected: ${missing_pkgs[*]}"
+    if command -v omarchy >/dev/null 2>&1; then
+      info "Installing dependencies via: omarchy pkg add ${missing_pkgs[*]}"
+      omarchy pkg add "${missing_pkgs[@]}"
+    elif command -v pacman >/dev/null 2>&1; then
+      info "Installing dependencies via: sudo pacman -S --needed --noconfirm ${missing_pkgs[*]}"
+      sudo pacman -S --needed --noconfirm "${missing_pkgs[@]}"
+    else
+      error "Cannot install missing packages: neither omarchy nor pacman is available."
+      exit 1
+    fi
+  else
+    success "All build dependencies are satisfied."
+  fi
+}
+
+build_project() {
+  info "Configuring project with CMake and Ninja..."
+  cmake -B "$ROOT_DIR/build" -G Ninja
+  info "Building daemon and CLI targets..."
+  cmake --build "$ROOT_DIR/build"
+  success "Build completed successfully."
+}
+
+install_binaries() {
+  info "Installing binaries into $HOME/.local/bin..."
+  mkdir -p "$HOME/.local/bin"
+
+  local daemon_bin="$ROOT_DIR/build/daemon/sony-xm3-daemon"
+  local ctl_bin="$ROOT_DIR/build/cli/sony-xm3-ctl"
+
+  if [[ ! -f "$daemon_bin" ]]; then
+    error "Daemon binary not found at $daemon_bin"
+    exit 1
+  fi
+  if [[ ! -f "$ctl_bin" ]]; then
+    error "CLI binary not found at $ctl_bin"
+    exit 1
+  fi
+
+  install -m 0755 "$daemon_bin" "$HOME/.local/bin/sony-xm3-daemon"
+  install -m 0755 "$ctl_bin" "$HOME/.local/bin/sony-xm3-ctl"
+  success "Binaries installed to $HOME/.local/bin/ (mode 0755)."
+}
+
+install_systemd_service() {
+  info "Installing systemd user service..."
+  local service_src="$ROOT_DIR/daemon/sony-xm3.service"
+  local service_dir="$HOME/.config/systemd/user"
+  local service_dest="$service_dir/sony-xm3.service"
+
+  if [[ ! -f "$service_src" ]]; then
+    error "Service unit not found at $service_src"
+    exit 1
+  fi
+
+  mkdir -p "$service_dir"
+  install -m 0644 "$service_src" "$service_dest"
+
+  info "Reloading systemd user daemon and enabling sony-xm3.service..."
+  systemctl --user daemon-reload 2>/dev/null || true
+  systemctl --user enable sony-xm3.service 2>/dev/null || true
+  success "Systemd user service installed and enabled."
+}
+
+deploy_plugin() {
+  info "Deploying Omarchy bar-widget plugin..."
+  local plugins_dir="$HOME/.local/share/omarchy/shell/plugins"
+  local plugin_dest="$plugins_dir/io.github.kevincardwell.omasonyxm3"
+  local user_plugins_dir="$HOME/.config/omarchy/plugins"
+  local user_plugin_dest="$user_plugins_dir/io.github.kevincardwell.omasonyxm3"
+
+  mkdir -p "$plugin_dest" "$user_plugin_dest"
+  rm -rf "$plugin_dest"/* "$user_plugin_dest"/*
+
+  for file in manifest.json Panel.qml Service.qml Model.js SonyIcon.qml; do
+    if [[ -f "$ROOT_DIR/$file" ]]; then
+      cp "$ROOT_DIR/$file" "$plugin_dest/"
+      cp "$ROOT_DIR/$file" "$user_plugin_dest/"
+    fi
+  done
+
+  # Validate plugin if validator is present
+  local validator="/usr/share/omarchy/bin/omarchy-plugin-validate"
+  if [[ -x "$validator" ]]; then
+    info "Validating plugin using $validator..."
+    "$validator" "$ROOT_DIR"
+    success "Plugin validation passed."
+  fi
+
+  success "Plugin deployed to $plugin_dest and $user_plugin_dest."
+
+  if command -v omarchy >/dev/null 2>&1; then
+    info "Enabling plugin io.github.kevincardwell.omasonyxm3 in Omarchy..."
+    omarchy plugin enable io.github.kevincardwell.omasonyxm3 2>/dev/null || true
+  fi
+}
+
+check_bluetooth_prerequisites() {
+  info "Checking Bluetooth prerequisites..."
+
+  # The daemon talks to the headset over an RFCOMM socket opened by this
+  # machine's own BlueZ stack. A USB Bluetooth *audio transmitter* (Avantree
+  # DG60 and similar) does its own pairing and presents to Linux as a USB sound
+  # card, so BlueZ never sees the headphones and none of this can reach them.
+  if ! compgen -G "/sys/class/bluetooth/hci*" >/dev/null 2>&1; then
+    warn "No Bluetooth adapter found (no /sys/class/bluetooth/hci*)."
+    warn "If your headphones run through a USB Bluetooth audio transmitter, the"
+    warn "daemon cannot reach them: pair the WH-1000XM3 to this machine's own"
+    warn "Bluetooth adapter instead. Install continues; the daemon will idle."
+    return 0
+  fi
+
+  if ! systemctl is-active --quiet bluetooth 2>/dev/null; then
+    warn "bluetooth.service is not running. Start it with:"
+    warn "  sudo systemctl enable --now bluetooth"
+  fi
+
+  if command -v bluetoothctl >/dev/null 2>&1; then
+    local paired
+    paired=$(timeout 5 bluetoothctl devices Paired 2>/dev/null | grep -i "WH-1000XM3" || true)
+    if [[ -z "$paired" ]]; then
+      warn "No paired WH-1000XM3 found. Pair it with this machine before use:"
+      warn "  bluetoothctl -- scan on   # then: pair <MAC>, trust <MAC>, connect <MAC>"
+    else
+      success "Found paired headset: ${paired}"
+    fi
+  fi
+}
+
+main() {
+  info "Starting omarchy-sony-xm3 setup..."
+  check_and_install_dependencies
+  check_bluetooth_prerequisites
+  build_project
+  install_binaries
+  install_systemd_service
+  deploy_plugin
+  chmod 755 "$ROOT_DIR/setup" 2>/dev/null || true
+  success "omarchy-sony-xm3 setup completed successfully!"
+}
+
+main

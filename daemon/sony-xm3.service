@@ -1,0 +1,13 @@
+[Unit]
+Description=Sony WH-1000XM3 Headless Bluetooth Daemon
+PartOf=graphical-session.target
+After=bluetooth.target graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/sony-xm3-daemon
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=graphical-session.target

@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.kevincardwell.omasonyxm3",
+  "name": "Sony WH-1000XM3",
+  "version": "0.1.0",
+  "author": "Jasper",
+  "license": "MIT",
+  "description": "Sony WH-1000XM3 Headphone Manager",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Sony WH-1000XM3",
+    "description": "Sony WH-1000XM3 Headphone Manager",
+    "category": "Audio",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

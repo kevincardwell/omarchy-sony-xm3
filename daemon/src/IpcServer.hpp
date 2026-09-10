@@ -1,0 +1,123 @@
+#pragma once
+
+#include "MDRProtocolV1.hpp"
+
+#include <cstdint>
+#include <cstddef>
+#include <string>
+#include <vector>
+#include <array>
+#include <span>
+#include <memory>
+#include <functional>
+#include <unordered_map>
+#include <chrono>
+#include <optional>
+#include <sys/poll.h>
+
+namespace omarchy::sony {
+
+struct ClientSession {
+    int fd{-1};
+    std::string inBuffer;
+    std::string outBuffer;
+    std::chrono::steady_clock::time_point connectedAt;
+};
+
+// Delegate callbacks for decoupling IpcServer from StateEngine and BluetoothManager
+struct IpcCallbacks {
+    std::function<std::string()> getStatusJson;
+    std::function<bool(protocol::NoiseMode mode, uint8_t ambientLevel, std::string& errorMsg)> setNoiseMode;
+    std::function<bool(uint8_t level, std::string& errorMsg)> setAmbientLevel;
+    std::function<bool(protocol::EqPreset preset, std::string& errorMsg)> setEqPreset;
+    std::function<bool(const std::array<int, 5>& bands, int clearBass, std::string& errorMsg)> setCustomEq;
+    std::function<bool(bool enabled, std::string& errorMsg)> setVoiceFocus;
+    std::function<bool(bool enabled, std::string& errorMsg)> setDsee;
+    std::function<bool(bool enabled, std::string& errorMsg)> setEarDetection;
+    std::function<bool(protocol::SurroundPreset preset, std::string& errorMsg)> setSurround;
+    std::function<bool(protocol::SoundPosition position, std::string& errorMsg)> setSoundPosition;
+    std::function<bool(protocol::AutoPowerOff timer, std::string& errorMsg)> setAutoPowerOff;
+    std::function<bool(protocol::ConnectionMode mode, std::string& errorMsg)> setConnectionMode;
+    std::function<bool(const std::vector<uint8_t>& packet)> sendPacket;
+    // Upper bound the daemon will accept for `ambient-level`, learned from the
+    // headset's NCASM capability response.
+    std::function<int()> getAmbientMaxLevel;
+
+    // Offline simulation test helper hooks
+    std::function<void(int level, bool charging)> onTestSetBattery;
+    std::function<void()> onTestDisconnect;
+    std::function<void()> onTestReconnect;
+};
+
+class IpcServer {
+public:
+    using CommandHandler = std::function<std::string(const std::string& commandLine)>;
+
+    explicit IpcServer(std::string socketPath = "");
+    ~IpcServer();
+
+    // Non-copyable, movable
+    IpcServer(const IpcServer&) = delete;
+    IpcServer& operator=(const IpcServer&) = delete;
+    IpcServer(IpcServer&&) noexcept;
+    IpcServer& operator=(IpcServer&&) noexcept;
+
+    // Path resolution utility
+    [[nodiscard]] static std::string resolveSocketPath(const std::string& overridePath = "");
+
+    // Lifecycle
+    bool start();
+    void stop();
+    [[nodiscard]] bool isRunning() const noexcept { return running_; }
+
+    // Handlers & Callbacks
+    void setCommandHandler(CommandHandler handler) { customHandler_ = std::move(handler); }
+    void setCallbacks(IpcCallbacks callbacks) { callbacks_ = std::move(callbacks); }
+
+    // Inspection
+    [[nodiscard]] const std::string& getSocketPath() const noexcept { return actualSocketPath_; }
+    [[nodiscard]] int getListenFd() const noexcept { return listenFd_; }
+    [[nodiscard]] size_t getClientCount() const noexcept { return clients_.size(); }
+
+    // Command parser (public for unit testing without sockets)
+    [[nodiscard]] std::string handleCommandLine(const std::string& line);
+    [[nodiscard]] std::string handleBuiltinCommand(const std::string& line);
+
+    // Event loop integration (poll/epoll)
+    void appendPollFds(std::vector<struct pollfd>& pfds) const;
+    void populatePollFds(std::vector<struct pollfd>& pfds) const { appendPollFds(pfds); }
+    void handleSocketEvent(int fd, short revents);
+    void handlePollEvents(std::span<const struct pollfd> pfds);
+
+    // Standalone polling helper
+    int pollOnce(int timeoutMs = 0);
+
+private:
+    void acceptClients();
+    void handleClientRead(int clientFd);
+    void handleClientWrite(int clientFd);
+    void closeClient(int clientFd);
+    bool queueResponse(ClientSession& session, const std::string& response);
+    bool flushClientOutBuffer(ClientSession& session);
+
+    uint8_t nextSeq() noexcept { return seq_++; }
+
+    std::string socketPathConfig_;
+    std::string actualSocketPath_;
+    int listenFd_{-1};
+    bool running_{false};
+    uint8_t seq_{0};
+    size_t maxLineLength_{4096};
+
+    CommandHandler customHandler_;
+    IpcCallbacks callbacks_;
+    std::unordered_map<int, ClientSession> clients_;
+};
+
+} // namespace omarchy::sony
+
+namespace omarchy::sony::protocol {
+    using IpcServer = omarchy::sony::IpcServer;
+    using IpcCallbacks = omarchy::sony::IpcCallbacks;
+    using ClientSession = omarchy::sony::ClientSession;
+}
