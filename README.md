@@ -121,7 +121,7 @@ sudo apt update && sudo apt install -y build-essential cmake ninja-build libblue
 ## Install
 
 ```bash
-git clone <this repo>
+git clone https://github.com/kevincardwell/omarchy-sony-xm3.git
 cd omarchy-sony-xm3
 ./setup
 ```
