@@ -152,6 +152,17 @@ prerequisites, builds with CMake + Ninja, installs `sony-xm3-daemon` and
 `sony-xm3-ctl` to `~/.local/bin/`, registers the `sony-xm3.service` user unit,
 and deploys the plugin to `~/.config/omarchy/plugins/`.
 
+**Installed from the Omarchy plugin marketplace** (or with `omarchy plugin
+add`)? That adds the bar widget only. The widget needs the daemon, so build and
+install it from the plugin's own directory:
+
+```bash
+~/.config/omarchy/plugins/io.github.kevincardwell.omasonyxm3/setup
+```
+
+Setup notices it is running from the installed plugin and uses those files in
+place.
+
 Pair the headset first if you have not already:
 
 ```bash
@@ -161,6 +172,21 @@ bluetoothctl
   trust   <MAC>
   connect <MAC>
 ```
+
+---
+
+## Uninstall
+
+```bash
+./setup --uninstall
+```
+
+This stops and removes `sony-xm3.service`, deletes the two binaries from
+`~/.local/bin/` and the state in `~/.local/state/sony-xm3/`, and runs
+`omarchy plugin remove`, which takes the widget off the bar and deletes the
+plugin directory. Your Bluetooth pairing is left alone. If you installed from
+the marketplace, run it as
+`~/.config/omarchy/plugins/io.github.kevincardwell.omasonyxm3/setup --uninstall`.
 
 ---
 

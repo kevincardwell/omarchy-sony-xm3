@@ -40,7 +40,8 @@ install binaries to ~/.local/bin, install and enable the systemd user service,
 and deploy the Omarchy bar-widget plugin.
 
 Options:
-  -h, --help    Display this help message and exit 0
+  -h, --help       Display this help message and exit 0
+  --uninstall      Stop and remove the service, binaries, plugin and state
 
 Steps performed:
   1. Detect Arch Linux (ID_LIKE=arch or /etc/arch-release) and check for
@@ -55,15 +56,21 @@ Steps performed:
      and (re)start it.
   5. Deploy the plugin to ~/.config/omarchy/plugins/io.github.kevincardwell.omasonyxm3,
      validate it, enable it next to the volume control, and restart the shell.
+     If this checkout already is that directory (installed with
+     `omarchy plugin add`), the files are used in place.
 HELP_EOF
 }
 
 # Handle command line flags
+UNINSTALL=0
 for arg in "$@"; do
   case "$arg" in
     -h|--help)
       print_help
       exit 0
+      ;;
+    --uninstall)
+      UNINSTALL=1
       ;;
     *)
       error "Unknown option: $arg"
@@ -194,11 +201,17 @@ deploy_plugin() {
   # The only directory Omarchy scans for user plugins.
   local plugin_dest="$HOME/.config/omarchy/plugins/$PLUGIN_ID"
 
-  mkdir -p "$plugin_dest"
-  rm -rf "${plugin_dest:?}"/*
-  for file in manifest.json Panel.qml Service.qml Model.js SonyIcon.qml; do
-    cp "$ROOT_DIR/$file" "$plugin_dest/"
-  done
+  # `omarchy plugin add` clones the whole repository straight into the plugin
+  # directory. Running setup from there must not wipe its own checkout.
+  if [[ "$(realpath -m "$plugin_dest")" == "$(realpath "$ROOT_DIR")" ]]; then
+    info "Running from the installed plugin directory; using its files in place."
+  else
+    mkdir -p "$plugin_dest"
+    rm -rf "${plugin_dest:?}"/*
+    for file in manifest.json Panel.qml Service.qml Model.js SonyIcon.qml; do
+      cp "$ROOT_DIR/$file" "$plugin_dest/"
+    done
+  fi
 
   if command -v omarchy >/dev/null 2>&1; then
     omarchy plugin validate "$plugin_dest"
@@ -252,7 +265,40 @@ check_bluetooth_prerequisites() {
   fi
 }
 
+uninstall() {
+  info "Uninstalling omarchy-sony-xm3..."
+
+  systemctl --user disable --now sony-xm3.service 2>/dev/null || true
+  rm -f "$HOME/.config/systemd/user/sony-xm3.service"
+  systemctl --user daemon-reload 2>/dev/null || true
+  success "sony-xm3.service stopped and removed."
+
+  rm -f "$HOME/.local/bin/sony-xm3-daemon" "$HOME/.local/bin/sony-xm3-ctl"
+  success "Binaries removed from $HOME/.local/bin/."
+
+  rm -rf "${XDG_STATE_HOME:-$HOME/.local/state}/sony-xm3"
+  success "State directory removed."
+
+  local plugin_dest="$HOME/.config/omarchy/plugins/$PLUGIN_ID"
+  if [[ -e "$plugin_dest" ]]; then
+    if command -v omarchy >/dev/null 2>&1; then
+      # Disables the widget, then deletes a git checkout or backs up a copy.
+      omarchy plugin remove "$PLUGIN_ID" --yes \
+        || warn "Could not remove the plugin; run: omarchy plugin remove $PLUGIN_ID"
+    else
+      rm -rf "${plugin_dest:?}"
+    fi
+    success "Plugin removed from the bar and from $plugin_dest."
+  fi
+
+  success "omarchy-sony-xm3 uninstalled. Your Bluetooth pairing is untouched."
+}
+
 main() {
+  if (( UNINSTALL )); then
+    uninstall
+    return
+  fi
   info "Starting omarchy-sony-xm3 setup..."
   check_and_install_dependencies
   check_bluetooth_prerequisites
