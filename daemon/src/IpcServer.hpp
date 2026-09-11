@@ -30,13 +30,21 @@ struct IpcCallbacks {
     std::function<bool(protocol::NoiseMode mode, uint8_t ambientLevel, std::string& errorMsg)> setNoiseMode;
     std::function<bool(uint8_t level, std::string& errorMsg)> setAmbientLevel;
     std::function<bool(protocol::EqPreset preset, std::string& errorMsg)> setEqPreset;
-    std::function<bool(const std::array<int, 5>& bands, int clearBass, std::string& errorMsg)> setCustomEq;
+    std::function<bool(protocol::EqPreset slot, const std::array<int, 5>& bands, int clearBass,
+                       std::string& errorMsg)> setCustomEq;
     std::function<bool(bool enabled, std::string& errorMsg)> setVoiceFocus;
     std::function<bool(bool enabled, std::string& errorMsg)> setDsee;
     std::function<bool(protocol::SurroundPreset preset, std::string& errorMsg)> setSurround;
     std::function<bool(protocol::SoundPosition position, std::string& errorMsg)> setSoundPosition;
     std::function<bool(protocol::AutoPowerOff timer, std::string& errorMsg)> setAutoPowerOff;
     std::function<bool(protocol::ConnectionMode mode, std::string& errorMsg)> setConnectionMode;
+    std::function<bool(bool start, std::string& errorMsg)> setOptimizer;
+    std::function<bool(uint8_t volume, std::string& errorMsg)> setVolume;
+    std::function<bool(protocol::PlaybackControl control, std::string& errorMsg)> setPlayback;
+    std::function<bool(protocol::NcButton button, std::string& errorMsg)> setNcButton;
+    std::function<bool(bool enabled, std::string& errorMsg)> setTouchPanel;
+    std::function<bool(bool enabled, std::string& errorMsg)> setVoiceGuidance;
+    std::function<int()> getVolumeMax;
     std::function<bool(const std::vector<uint8_t>& packet)> sendPacket;
     // Upper bound the daemon will accept for `ambient-level`, learned from the
     // headset's NCASM capability response.

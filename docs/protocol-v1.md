@@ -367,6 +367,113 @@ by reporting its existing timer — because it has no wearing sensor.
 
 ---
 
+## Device info
+
+```
+04 01     CONNECT_GET_DEVICE_INFO / MODEL_NAME  -> 05 01 0a "WH-1000XM3"
+04 02     CONNECT_GET_DEVICE_INFO / FW_VERSION  -> 05 02 05 "4.5.2"
+```
+
+The model name is a better display name than BlueZ's, which drifts to the BLE
+advertisement's `LE_WH-1000XM3`.
+
+---
+
+## NC Optimizer
+
+```
+80 01                  capability  -> 81 01 02 01 09 01 02
+                                      (personal fit ~9 s, barometric ~2 s)
+84 01 00 01            start           84 01 00 00   cancel
+82 01 / 85 …           status: 85 01 <common> <state>
+86 01 / 89 …           result: 87 01 <personalType> <personal> <baroType> <baro>
+```
+
+| State byte | Meaning |
+|---|---|
+| `00` | idle |
+| `01` | measuring fit (plays test tones) |
+| `02` | measuring atmospheric pressure |
+| `10` | optimizing |
+| `11` | done |
+
+The barometric value `07`…`0a` is the measured pressure, 0.7…1.0 atm. While it
+runs, the headset suspends noise control (`65 02 01`) and restores it after
+(`65 02 00`), so noise-mode commands in the meantime are pointless. The headset
+must be worn — it measures the fit acoustically.
+
+---
+
+## Playback controller
+
+```
+a0 01                  capability  -> a1 01 1f 01 01   (31 volume steps: 0..30)
+a6 01 20               volume      -> a7 01 20 <vol>   (notified as a9 01 20 <vol>)
+a8 01 20 <vol>         set volume
+a4 01 00 <ctl>         transport: 01 pause, 07 play, 02 next, 03 previous
+```
+
+This is the headset's AVRCP absolute volume, i.e. the same volume PipeWire drives
+when it uses hardware volume. Play state (`a3`/`a5`) is always reported as
+"unsettled" on the XM3, so the panel offers separate play and pause buttons
+rather than a toggle.
+
+---
+
+## General settings
+
+Generic numbered slots, which the headset names itself in its capability reply:
+
+| Slot | Name reported | Type | Values |
+|---|---|---|---|
+| `d1` | `ASSIGNABLE_KEY_SETTING` | list | 0 noise control, 1 Google Assistant, 2 Amazon Alexa |
+| `d2` | `TOUCH_PANEL_SETTING` | boolean | `01` on, `00` off |
+
+```
+d6 <slot>                    read   -> d7 <slot> <type> <value>
+d8 <slot> <type> <value>     write  (notified as d9 …)
+```
+
+Booleans are ON = `01` on the XM3; the XM5 table inverts this. Writing the value
+a setting already has is ACKed but not notified. Reassigning the button can
+raise alert `99 01 02 01` (key-assign change will disconnect); the daemon answers
+it yes only for a change the user just asked for.
+
+---
+
+## Voice guidance (table 2)
+
+Table 2 is sent as `DATA_MDR_NO2` frames (type `0x0e`). **Its command bytes
+collide with table 1's** — `47` is a surround reply in table 1 and a voice-guidance
+reply in table 2 — so the frame type has to be carried all the way to the parser.
+
+```
+40 01          capability -> 41 01 <on/off switchable> <language switchable> <n> <languages…>
+46 01 01       on/off     -> 47 01 01 <0|1>          set: 48 01 01 <0|1>
+46 01 02       language   -> 47 01 02 <language id>  (01 = English)
+```
+
+Changing the language needs a voice-pack download, so it is not offered.
+
+---
+
+## Alerts
+
+`99 01 <message> 01` is the headset asking "proceed?". The reply is
+`98 01 <message> <01 yes | 00 no>`. Seen on the XM3: `01` (connection-mode change,
+when EQ/VPT is sent on LDAC) and `02` (NC button reassignment). The daemon
+declines anything the user did not explicitly ask for.
+
+---
+
+## Adaptive Sound Control
+
+`70 01` → `71 01 01`: supported, but the protocol side is only `SENSE_SET_STATUS`
+(`74`) — a flag. The activity detection that drives it runs in Sony's phone app on
+the phone's sensors, so there is nothing for a desktop to drive.
+
+---
+
 ## What the XM3 does not have
 
 Present in the v1 table but not on this headset, or absent from v1 entirely:
@@ -376,8 +483,7 @@ Present in the v1 table but not on this headset, or absent from v1 entirely:
 - **Wearing detection** — no sensor; `CONTROL_BY_WEARING` never answers, and the
   "power off when removed" timer is ignored.
 - **DSEE Extreme** — the XM3 has DSEE HX, the earlier algorithm.
-- **Adaptive Sound Control** and **NC Optimizer** — the XM3 *does* support both
-  (support functions `0x71` and `0x81`), but this project does not drive them yet.
+- **Adaptive Sound Control** as a headset feature — see above; it lives in the phone app.
 - **Firmware updates** — the Sony Sound Connect mobile app remains the only way.
 
 ---

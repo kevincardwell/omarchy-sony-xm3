@@ -543,7 +543,11 @@ std::string IpcServer::handleBuiltinCommand(const std::string& line) {
         }
         std::string presetStr = toLower(tokens[1]);
 
-        if (presetStr == "custom" || presetStr == "manual") {
+        const bool isSlot = presetStr == "custom" || presetStr == "manual" ||
+                            presetStr == "user1" || presetStr == "user2";
+        // A slot name alone selects it; followed by six numbers it also sets
+        // that slot's bands.
+        if (isSlot && tokens.size() > 2) {
             if (tokens.size() < 8) {
                 return "ERR custom eq requires 5 bands and clear bass (6 integers [-10, 10])\n";
             }
@@ -567,9 +571,12 @@ std::string IpcServer::handleBuiltinCommand(const std::string& line) {
                 return "ERR clear bass out of range [-10, 10]\n";
             }
 
+            const auto slot = presetStr == "user1" ? protocol::EqPreset::USER1
+                            : presetStr == "user2" ? protocol::EqPreset::USER2
+                                                   : protocol::EqPreset::CUSTOM;
             if (callbacks_.setCustomEq) {
                 std::string err;
-                if (!callbacks_.setCustomEq(bands, clearBass, err)) {
+                if (!callbacks_.setCustomEq(slot, bands, clearBass, err)) {
                     return "ERR " + (err.empty() ? "failed to set custom eq" : err) + "\n";
                 }
             }
@@ -577,7 +584,7 @@ std::string IpcServer::handleBuiltinCommand(const std::string& line) {
         } else {
             static const std::vector<std::string> validPresets = {
                 "off", "bright", "excited", "mellow", "relaxed",
-                "vocal", "treble", "bass", "speech", "user1", "user2"
+                "vocal", "treble", "bass", "speech", "custom", "manual", "user1", "user2"
             };
             bool found = false;
             for (const auto& p : validPresets) {
@@ -693,6 +700,101 @@ std::string IpcServer::handleBuiltinCommand(const std::string& line) {
             if (!callbacks_.setConnectionMode(mode, err)) {
                 return "ERR " + (err.empty() ? "failed to set connection mode" : err) + "\n";
             }
+        }
+        return "OK\n";
+    }
+
+    // 10. optimizer <start|cancel>  — NC Optimizer (wear the headset: it plays test tones)
+    if (verb == "optimizer") {
+        const std::string val = tokens.size() >= 2 ? toLower(tokens[1]) : "";
+        if (val != "start" && val != "cancel") {
+            return "ERR expected start|cancel\n";
+        }
+        std::string err;
+        if (callbacks_.setOptimizer && !callbacks_.setOptimizer(val == "start", err)) {
+            return "ERR " + (err.empty() ? "failed to control the optimizer" : err) + "\n";
+        }
+        return "OK\n";
+    }
+
+    // 11. volume <0..max>  — the headset's own volume (AVRCP absolute volume)
+    if (verb == "volume") {
+        const int maxVolume = callbacks_.getVolumeMax ? callbacks_.getVolumeMax() : 30;
+        int level = 0;
+        if (tokens.size() < 2 || !parseInt(tokens[1], level)) {
+            return "ERR expected a volume 0-" + std::to_string(maxVolume) + "\n";
+        }
+        if (level < 0 || level > maxVolume) {
+            return "ERR volume out of range [0-" + std::to_string(maxVolume) + "]\n";
+        }
+        std::string err;
+        if (callbacks_.setVolume && !callbacks_.setVolume(static_cast<uint8_t>(level), err)) {
+            return "ERR " + (err.empty() ? "failed to set volume" : err) + "\n";
+        }
+        return "OK\n";
+    }
+
+    // 12. playback <play|pause|next|previous>
+    if (verb == "playback") {
+        const auto control = protocol::stringToPlayback(tokens.size() >= 2 ? toLower(tokens[1]) : "");
+        if (control == protocol::PlaybackControl::UNKNOWN) {
+            return "ERR expected play|pause|next|previous\n";
+        }
+        std::string err;
+        if (callbacks_.setPlayback && !callbacks_.setPlayback(control, err)) {
+            return "ERR " + (err.empty() ? "failed to send playback control" : err) + "\n";
+        }
+        return "OK\n";
+    }
+
+    // 13. nc-button <ambient|google-assistant|alexa>  — what the NC/AMBIENT button does
+    if (verb == "nc-button") {
+        const auto button = protocol::stringToNcButton(tokens.size() >= 2 ? toLower(tokens[1]) : "");
+        if (button == protocol::NcButton::UNKNOWN) {
+            return "ERR expected ambient|google-assistant|alexa\n";
+        }
+        std::string err;
+        if (callbacks_.setNcButton && !callbacks_.setNcButton(button, err)) {
+            return "ERR " + (err.empty() ? "failed to assign the NC button" : err) + "\n";
+        }
+        return "OK\n";
+    }
+
+    // 14. touch-panel <on|off>, voice-guidance <on|off>
+    if (verb == "touch-panel" || verb == "voice-guidance") {
+        const std::string val = tokens.size() >= 2 ? toLower(tokens[1]) : "";
+        if (val != "on" && val != "off") {
+            return "ERR expected on|off\n";
+        }
+        std::string err;
+        const bool enabled = (val == "on");
+        const bool ok = verb == "touch-panel"
+            ? (!callbacks_.setTouchPanel || callbacks_.setTouchPanel(enabled, err))
+            : (!callbacks_.setVoiceGuidance || callbacks_.setVoiceGuidance(enabled, err));
+        if (!ok) {
+            return "ERR " + (err.empty() ? "failed to set " + verb : err) + "\n";
+        }
+        return "OK\n";
+    }
+
+    // raw <hex byte> ... : send an arbitrary payload, for protocol exploration.
+    // The headset's reply is logged by the daemon, not returned here.
+    if (verb == "raw" || verb == "raw2") {
+        if (tokens.size() < 2) {
+            return "ERR expected hex bytes, e.g. raw 04 02\n";
+        }
+        std::vector<uint8_t> payload;
+        for (size_t i = 1; i < tokens.size(); ++i) {
+            char* end = nullptr;
+            const long v = std::strtol(tokens[i].c_str(), &end, 16);
+            if (end == tokens[i].c_str() || *end != '\0' || v < 0 || v > 0xFF) {
+                return "ERR invalid hex byte '" + tokens[i] + "'\n";
+            }
+            payload.push_back(static_cast<uint8_t>(v));
+        }
+        if (callbacks_.sendPacket) {
+            callbacks_.sendPacket(verb == "raw2" ? protocol::serializeRawT2(payload)
+                                                 : protocol::serializeRaw(payload));
         }
         return "OK\n";
     }

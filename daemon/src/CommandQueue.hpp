@@ -7,6 +7,7 @@
 #include <deque>
 #include <functional>
 #include <optional>
+#include <string_view>
 #include <vector>
 
 namespace omarchy::sony::protocol {
@@ -29,10 +30,27 @@ public:
 
     // Takes a framed packet from the serializers but keeps only its payload:
     // the sequence number is decided when the frame is actually sent.
-    void enqueue(const std::vector<uint8_t>& frame, const char* what) {
+    //
+    // With `coalesce`, a command still waiting in the queue under the same
+    // `what` is replaced rather than joined: the newest value wins. That is what
+    // stops a dragged slider from queueing a backlog that plays out for seconds
+    // after the drag has ended. Never coalesce commands whose every instance
+    // matters (queries, raw probes).
+    void enqueue(const std::vector<uint8_t>& frame, const char* what, bool coalesce = false) {
         auto unpacked = unpackFrame(frame);
         if (!unpacked) return;
-        pending_.push_back({std::move(unpacked->payload), what});
+        if (coalesce) {
+            for (auto& item : pending_) {
+                if (std::string_view(item.what) == what) {
+                    item.payload = std::move(unpacked->payload);
+                    item.type = unpacked->type;
+                    return;
+                }
+            }
+        }
+        // Keep the frame type: table-2 commands (DATA_MDR_NO2) share command
+        // bytes with table 1, so the type is what tells them apart.
+        pending_.push_back({std::move(unpacked->payload), what, unpacked->type});
         pump();
     }
 
@@ -82,6 +100,7 @@ private:
     struct Item {
         std::vector<uint8_t> payload;
         const char* what;
+        PacketType type{PacketType::DATA_MDR};
     };
 
     static constexpr int kMaxRetries = 3;
@@ -96,12 +115,14 @@ private:
 
     void transmit() {
         if (log_) {
-            fprintf(stderr, "[MDR] TX seq=%u %s:", static_cast<unsigned>(seq_), inFlight_->what);
+            fprintf(stderr, "[MDR] TX%s seq=%u %s:",
+                    inFlight_->type == PacketType::DATA_MDR_NO2 ? " T2" : "",
+                    static_cast<unsigned>(seq_), inFlight_->what);
             for (uint8_t b : inFlight_->payload) fprintf(stderr, " %02x", b);
             fprintf(stderr, "\n");
             fflush(stderr);
         }
-        sender_(packFrame(PacketType::DATA_MDR, seq_, inFlight_->payload));
+        sender_(packFrame(inFlight_->type, seq_, inFlight_->payload));
         sentAt_ = Clock::now();
     }
 

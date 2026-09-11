@@ -198,6 +198,15 @@ int main(int argc, char* argv[]) {
         stateEngine.setSoundPosition("off");
         stateEngine.setAutoPowerOff("180min");
         stateEngine.setConnectionMode("stable");
+        stateEngine.modifyState([](HeadphoneState& s) {
+            s.volume = 17;
+            s.nc_button = "ambient";
+            s.touch_panel = true;
+            s.voice_guidance = true;
+            s.voice_guidance_language = "English";
+            s.optimizer_pressure = "1.0";
+            s.firmware_version = "4.5.2";
+        });
         stateEngine.save();
     }
 
@@ -234,6 +243,12 @@ int main(int argc, char* argv[]) {
     });
     commands.setLogging(true);
 
+    // Set when the user asks to reassign the NC/AMBIENT button, so that the
+    // headset's "this will disconnect — proceed?" alert for exactly that change
+    // is answered yes. Any other alert is declined: nothing should disconnect
+    // the headset that the user did not ask for.
+    bool keyAssignRequested = false;
+
     // Remembers the last true ambient step so that switching ANC -> Ambient
     // returns to where the user left the slider rather than to a default.
     int lastAmbientStep = -1;
@@ -242,9 +257,9 @@ int main(int argc, char* argv[]) {
         return btManager && btManager->getState() == ConnectionState::CONNECTED;
     };
 
-    auto send = [&](const std::vector<uint8_t>& packet, const char* what) {
+    auto send = [&](const std::vector<uint8_t>& packet, const char* what, bool coalesce = false) {
         if (connected()) {
-            commands.enqueue(packet, what);
+            commands.enqueue(packet, what, coalesce);
         } else {
             fprintf(stderr, "[DAEMON] Not connected; dropped %s\n", what);
             fflush(stderr);
@@ -271,6 +286,8 @@ int main(int argc, char* argv[]) {
             send(serializeQueryProtocolInfo(), "handshake protocol info");
             send(serializeQueryCapabilityInfo(), "handshake capability info");
             send(serializeQuerySupportFunction(), "handshake support function");
+            send(serializeQueryModelName(), "query model name");
+            send(serializeQueryFirmwareVersion(), "query firmware version");
             send(serializeQueryNcAsmCapability(), "query nc/asm capability");
             send(serializeQueryBattery(), "query battery");
             send(serializeQueryNoiseMode(), "query noise mode");
@@ -281,6 +298,14 @@ int main(int argc, char* argv[]) {
             send(serializeQuerySoundPosition(), "query sound position");
             send(serializeQueryAutoPowerOff(), "query auto power off");
             send(serializeQueryConnectionMode(), "query connection mode");
+            send(serializeQueryOptimizerStatus(), "query optimizer status");
+            send(serializeQueryOptimizerParam(), "query optimizer result");
+            send(serializeQueryPlaybackCapability(), "query playback capability");
+            send(serializeQueryVolume(), "query volume");
+            send(serializeQueryNcButton(), "query nc button");
+            send(serializeQueryTouchPanel(), "query touch panel");
+            send(serializeQueryVoiceGuidance(), "query voice guidance");
+            send(serializeQueryVoiceGuidanceLanguage(), "query voice guidance language");
         }
     };
 
@@ -326,7 +351,8 @@ int main(int argc, char* argv[]) {
                 auto ack = serializeACK(unpacked.seq);
                 btManager->sendPacket(ack);
 
-                fprintf(stderr, "[DAEMON] RX payload (cmd=0x%02x, size=%zu): ",
+                fprintf(stderr, "[DAEMON] RX%s payload (cmd=0x%02x, size=%zu): ",
+                        unpacked.type == PacketType::DATA_MDR_NO2 ? " T2" : "",
                         unpacked.payload.empty() ? 0 : unpacked.payload[0], unpacked.payload.size());
                 for (uint8_t b : unpacked.payload) {
                     fprintf(stderr, "%02x ", b);
@@ -335,7 +361,22 @@ int main(int argc, char* argv[]) {
                 fflush(stderr);
 
                 // Update state from payload
-                bool changed = protocol::parseInboundPayload(unpacked.payload, stateEngine.getStateUnsafe());
+                bool changed = unpacked.type == PacketType::DATA_MDR_NO2
+                    ? protocol::parseInboundPayloadT2(unpacked.payload, stateEngine.getStateUnsafe())
+                    : protocol::parseInboundPayload(unpacked.payload, stateEngine.getStateUnsafe());
+                // A "proceed?" alert: [0x99, FIXED_MESSAGE, message, POSITIVE_NEGATIVE]
+                if (unpacked.type == PacketType::DATA_MDR && unpacked.payload.size() >= 4 &&
+                    unpacked.payload[0] == static_cast<uint8_t>(Command::ALERT_NTFY_PARAM) &&
+                    unpacked.payload[1] == 0x01 && unpacked.payload[3] == 0x01) {
+                    const uint8_t message = unpacked.payload[2];
+                    const bool proceed = (message == kAlertKeyAssignChange && keyAssignRequested);
+                    keyAssignRequested = false;
+                    fprintf(stderr, "[DAEMON] Headset asked to confirm alert 0x%02x; answering %s\n",
+                            message, proceed ? "yes" : "no");
+                    fflush(stderr);
+                    send(serializeAlertReply(message, proceed), "alert reply");
+                }
+
                 if (changed) {
                     stateEngine.save();
                     const auto snapshot = stateEngine.getState();
@@ -389,9 +430,9 @@ int main(int argc, char* argv[]) {
         fflush(stderr);
 
         if (mode == NoiseMode::OFF) {
-            send(serializeNcAsm(false, step, false), "noise off");
+            send(serializeNcAsm(false, step, false), "noise off", true);
         } else {
-            send(serializeNcAsm(true, step, voiceFocus), "noise mode");
+            send(serializeNcAsm(true, step, voiceFocus), "noise mode", true);
         }
         return true;
     };
@@ -404,7 +445,7 @@ int main(int argc, char* argv[]) {
         stateEngine.save();
         fprintf(stderr, "[DAEMON] Ambient step: %u\n", (unsigned)level);
         fflush(stderr);
-        send(serializeAmbientLevel(level, voiceFocus), "ambient level");
+        send(serializeAmbientLevel(level, voiceFocus), "ambient level", true);
         return true;
     };
     ipcCb.setVoiceFocus = [&](bool enabled, std::string& /*err*/) {
@@ -415,7 +456,7 @@ int main(int argc, char* argv[]) {
         // current step rather than inventing a separate message for it.
         const uint8_t step = static_cast<uint8_t>(snapshot.ambient_sound_level);
         const bool noiseOn = snapshot.noise_mode != "off";
-        send(serializeNcAsm(noiseOn, step, enabled), "focus on voice");
+        send(serializeNcAsm(noiseOn, step, enabled), "focus on voice", true);
         return true;
     };
     // On "Priority on sound quality" (LDAC) the XM3 cannot run its EQ or VPT
@@ -437,11 +478,11 @@ int main(int argc, char* argv[]) {
         send(serializeEqPreset(preset), "eq preset");
         return true;
     };
-    ipcCb.setCustomEq = [&](const std::array<int, 5>& bands, int clearBass, std::string& err) {
+    ipcCb.setCustomEq = [&](EqPreset slot, const std::array<int, 5>& bands, int clearBass, std::string& err) {
         if (dspBlockedByLdac("EQ", err)) return false;
-        stateEngine.updateCustomEq(bands, clearBass);
+        stateEngine.updateCustomEq(bands, clearBass, eqPresetToString(slot));
         stateEngine.save();
-        send(serializeCustomEq(bands, clearBass), "custom eq");
+        send(serializeCustomEq(bands, clearBass, 0, slot), "custom eq", true);
         return true;
     };
     ipcCb.setDsee = [&](bool enabled, std::string& /*err*/) {
@@ -477,6 +518,41 @@ int main(int argc, char* argv[]) {
         send(serializeQueryEq(), "re-query eq after mode change");
         send(serializeQuerySurround(), "re-query surround after mode change");
         send(serializeQuerySoundPosition(), "re-query sound position after mode change");
+        return true;
+    };
+    ipcCb.setOptimizer = [&](bool start, std::string& /*err*/) {
+        // Progress and the result arrive as notifications; the headset has to
+        // be worn, because it measures fit by playing test tones.
+        stateEngine.modifyState([&](HeadphoneState& s) {
+            s.optimizer_state = start ? "measuring-fit" : "idle";
+        });
+        send(serializeOptimizer(start), start ? "optimizer start" : "optimizer cancel");
+        return true;
+    };
+    ipcCb.getVolumeMax = [&]() { return stateEngine.getState().volume_max; };
+    ipcCb.setVolume = [&](uint8_t volume, std::string& /*err*/) {
+        stateEngine.modifyState([&](HeadphoneState& s) { s.volume = volume; });
+        send(serializeVolume(volume), "volume", true);
+        return true;
+    };
+    ipcCb.setPlayback = [&](PlaybackControl control, std::string& /*err*/) {
+        send(serializePlayback(control), "playback");
+        return true;
+    };
+    ipcCb.setNcButton = [&](NcButton button, std::string& /*err*/) {
+        keyAssignRequested = true;
+        stateEngine.modifyState([&](HeadphoneState& s) { s.nc_button = ncButtonToString(button); });
+        send(serializeNcButton(button), "nc button");
+        return true;
+    };
+    ipcCb.setTouchPanel = [&](bool enabled, std::string& /*err*/) {
+        stateEngine.modifyState([&](HeadphoneState& s) { s.touch_panel = enabled; });
+        send(serializeTouchPanel(enabled), "touch panel");
+        return true;
+    };
+    ipcCb.setVoiceGuidance = [&](bool enabled, std::string& /*err*/) {
+        stateEngine.modifyState([&](HeadphoneState& s) { s.voice_guidance = enabled; });
+        send(serializeVoiceGuidance(enabled), "voice guidance");
         return true;
     };
     ipcCb.sendPacket = [&](const std::vector<uint8_t>& packet) {

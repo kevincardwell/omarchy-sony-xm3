@@ -64,13 +64,22 @@ void print_usage(std::ostream& os) {
        << "  voice-focus <on|off>       Focus on Voice (ambient step 2 and above)\n"
        << "  eq <preset>                off | bright | excited | mellow | relaxed |\n"
        << "                             vocal | treble | bass | speech | user1 | user2\n"
-       << "  eq custom <b1..b5> <cb>    Five bands and Clear Bass, each -10..10\n"
+       << "  eq <slot> <b1..b5> <cb>    Set a custom slot's bands: slot = custom | user1 | user2\n"
+       << "                             (five bands 400Hz..16kHz, then Clear Bass, each -10..10)\n"
        << "  dsee <on|off>              DSEE HX upscaling\n"
        << "  surround <preset>          off | outdoor | arena | concert | club\n"
        << "  sound-position <pos>       off | front-left | front-right | front |\n"
        << "                             rear-left | rear-right\n"
        << "  auto-power-off <value>     off | 5min | 30min | 60min | 180min\n"
-       << "  connection <mode>          quality | stable\n\n"
+       << "  connection <mode>          quality | stable\n"
+       << "  optimizer <start|cancel>   NC Optimizer (wear the headset; it plays test tones)\n"
+       << "  volume <0-30>              Headset volume\n"
+       << "  playback <action>          play | pause | next | previous\n"
+       << "  nc-button <function>       ambient | google-assistant | alexa\n"
+       << "  touch-panel <on|off>       Touch sensor control panel\n"
+       << "  voice-guidance <on|off>    Spoken prompts (\"Bluetooth connected\", battery…)\n"
+       << "  raw <hex bytes>            Send a raw table-1 payload (reply goes to the daemon log)\n"
+       << "  raw2 <hex bytes>           Same, for table 2 (voice guidance)\n\n"
        << "Options:\n"
        << "  -s, --socket <path>  Override socket path\n"
        << "  -h, --help           Show help\n"
@@ -305,7 +314,8 @@ int main(int argc, char* argv[]) {
             return 1;
         }
         std::string preset = to_lower(remaining[1]);
-        if (preset == "custom" || preset == "manual") {
+        const bool isSlot = preset == "custom" || preset == "manual" || preset == "user1" || preset == "user2";
+        if (isSlot && remaining.size() > 2) {
             if (remaining.size() < 8) {
                 std::cerr << "Error: 'eq custom' requires 5 bands and clear bass (6 integers between -10 and 10)\n";
                 return 1;
@@ -332,7 +342,7 @@ int main(int argc, char* argv[]) {
                 std::cerr << "Error: Clear Bass must be between -10 and 10\n";
                 return 1;
             }
-            std::string cmd = "eq custom " + std::to_string(bands[0]) + " "
+            std::string cmd = "eq " + preset + " " + std::to_string(bands[0]) + " "
                                            + std::to_string(bands[1]) + " "
                                            + std::to_string(bands[2]) + " "
                                            + std::to_string(bands[3]) + " "
@@ -343,7 +353,7 @@ int main(int argc, char* argv[]) {
 
         static const std::vector<std::string> valid_presets = {
             "off", "bright", "excited", "mellow", "relaxed",
-            "vocal", "treble", "bass", "speech", "user1", "user2"
+            "vocal", "treble", "bass", "speech", "custom", "manual", "user1", "user2"
         };
         if (std::find(valid_presets.begin(), valid_presets.end(), preset) == valid_presets.end()) {
             std::cerr << "Error: Unknown EQ preset '" << remaining[1] << "'\n";
@@ -399,6 +409,46 @@ int main(int argc, char* argv[]) {
             return 1;
         }
         return send_command(socket_path, "auto-power-off " + to_lower(remaining[1]) + "\n", false);
+    }
+
+    // Enum-valued settings: validated here for a friendly message, and again
+    // by the daemon, which is the authority.
+    static const std::vector<std::pair<std::string, std::vector<std::string>>> kEnumVerbs = {
+        {"optimizer", {"start", "cancel"}},
+        {"playback", {"play", "pause", "next", "previous"}},
+        {"nc-button", {"ambient", "google-assistant", "alexa"}},
+        {"touch-panel", {"on", "off"}},
+        {"voice-guidance", {"on", "off"}},
+    };
+    for (const auto& [verb, allowed] : kEnumVerbs) {
+        if (subcmd != verb) continue;
+        const std::string val = remaining.size() >= 2 ? to_lower(remaining[1]) : "";
+        if (std::find(allowed.begin(), allowed.end(), val) == allowed.end()) {
+            std::cerr << "Error: '" << verb << "' requires one of:";
+            for (const auto& a : allowed) std::cerr << " " << a;
+            std::cerr << "\n";
+            return 1;
+        }
+        return send_command(socket_path, verb + " " + val + "\n", false);
+    }
+
+    if (subcmd == "volume") {
+        int level = 0;
+        if (remaining.size() < 2 || !parse_int(remaining[1], level) || level < 0 || level > 30) {
+            std::cerr << "Error: 'volume' requires an integer between 0 and 30\n";
+            return 1;
+        }
+        return send_command(socket_path, "volume " + std::to_string(level) + "\n", false);
+    }
+
+    if (subcmd == "raw" || subcmd == "raw2") {
+        if (remaining.size() < 2) {
+            std::cerr << "Error: 'raw' needs hex payload bytes, e.g. raw 04 02\n";
+            return 1;
+        }
+        std::string cmd = subcmd;
+        for (size_t i = 1; i < remaining.size(); ++i) cmd += " " + remaining[i];
+        return send_command(socket_path, cmd + "\n", false);
     }
 
     if (subcmd == "connection") {

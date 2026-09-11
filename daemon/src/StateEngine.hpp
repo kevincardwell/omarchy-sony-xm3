@@ -89,8 +89,11 @@ public:
     bool setEqPreset(const std::string& preset);
     bool updateEqPreset(const std::string& preset) { return setEqPreset(preset); }
 
-    bool setCustomEq(const std::array<int, 5>& bands, int clearBass);
-    bool updateCustomEq(const std::array<int, 5>& bands, int clearBass) { return setCustomEq(bands, clearBass); }
+    // slot: "custom" (Manual), "user1" or "user2"
+    bool setCustomEq(const std::array<int, 5>& bands, int clearBass, const std::string& slot = "custom");
+    bool updateCustomEq(const std::array<int, 5>& bands, int clearBass, const std::string& slot = "custom") {
+        return setCustomEq(bands, clearBass, slot);
+    }
 
     // DSEE HX upscaling (the XM3's equivalent of the XM4/XM5 "DSEE Extreme").
     void setDsee(bool enabled);

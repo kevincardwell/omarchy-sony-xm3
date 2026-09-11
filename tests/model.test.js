@@ -53,6 +53,9 @@ const Model = new Function(
     defaultStatus, parseStatus, clamp,
     stepToNoiseMode, isVoiceFocusAvailable, cycleNoiseMode,
     dspAvailable, connectionModeName, dseeDescription,
+    EQ_CUSTOM_SLOTS, EQ_BAND_LABELS, NC_BUTTONS, PLAYBACK_ACTIONS,
+    isCustomEqSlot, isOptimizerRunning, optimizerDescription, ncButtonName, ncButtonDescription,
+    autoPowerOffLabel, voiceGuidanceDescription, volumeFraction, noiseModeButtonLabel,
     noiseModeName, noiseModeIcon, eqPresetName, eqPresetButtonLabel,
     surroundName, surroundButtonLabel, soundPositionName,
     batteryIcon, formatBattery, levelFraction, elideError
@@ -167,7 +170,7 @@ suite("Suite 3: Full payload parsing", () => {
   check("low battery -> connection mode", low.connectionMode, "stable");
 
   const eq = Model.parseStatus(fixture("status_connected_custom_eq.json"));
-  check("custom eq -> preset", eq.eqPreset, "custom");
+  check("custom eq -> preset (Custom 2)", eq.eqPreset, "user2");
   check("custom eq -> bands", eq.eqCustomBands, [-4, 2, 0, 3, -1]);
   check("custom eq -> clear bass", eq.clearBass, 5);
 });
@@ -223,13 +226,17 @@ suite("Suite 7: Vocabulary shared with the daemon", () => {
   // These lists are the plugin's half of a contract with sony-xm3-ctl. If one
   // drifts, the panel starts issuing commands the daemon rejects.
   check("noise modes", Model.NOISE_MODES, ["anc", "wind", "ambient", "off"]);
+  // The XM3's EQ capability reports exactly these twelve.
   check("eq presets", Model.EQ_PRESETS,
-        ["off", "bright", "excited", "mellow", "relaxed", "vocal", "treble", "bass", "speech", "custom"]);
+        ["off", "bright", "excited", "mellow", "relaxed", "vocal", "treble", "bass", "speech",
+         "custom", "user1", "user2"]);
   check("surround presets", Model.SURROUND_PRESETS, ["off", "outdoor", "arena", "concert", "club"]);
   check("sound positions", Model.SOUND_POSITIONS,
         ["off", "front-left", "front-right", "front", "rear-left", "rear-right"]);
   check("auto power off values", Model.AUTO_POWER_OFF_VALUES,
-        ["off", "5min", "30min", "60min", "180min"]);
+        ["5min", "30min", "60min", "180min", "off"]);
+  check("nc button functions", Model.NC_BUTTONS, ["ambient", "google-assistant", "alexa"]);
+  check("playback actions", Model.PLAYBACK_ACTIONS, ["previous", "play", "pause", "next"]);
   check("connection modes", Model.CONNECTION_MODES, ["quality", "stable"]);
   check("ambient steps start at 2", Model.STEP_AMBIENT_MIN, 2);
   check("default max ambient step", Model.STEP_AMBIENT_MAX_DEFAULT, 19);
@@ -292,6 +299,55 @@ suite("Suite 9: LDAC versus the headset's own processing (observed on hardware)"
   const legacy = Model.parseStatus(JSON.stringify({ schema_version: 1, connected: true, ear_detection: false }));
   check("a stale ear_detection field is ignored, not an error", legacy.ok, true);
 });
+// ---------------------------------------------------------------------------
+suite("Suite 10: Device features probed from the headset", () => {
+  const anc = Model.parseStatus(fixture("status_connected_anc.json"));
+  check("firmware version", anc.firmwareVersion, "4.5.2");
+  check("volume", anc.volume, 17);
+  check("volume max", anc.volumeMax, 30);
+  check("nc button", anc.ncButton, "ambient");
+  check("touch panel", anc.touchPanel, true);
+  check("voice guidance", anc.voiceGuidance, true);
+  check("voice guidance language", anc.voiceGuidanceLanguage, "English");
+  check("optimizer idle", anc.optimizerState, "idle");
+  check("optimizer pressure", anc.optimizerPressure, "1.0");
+
+  const alt = Model.parseStatus(fixture("status_connected_custom_eq.json"));
+  check("nc button: assistant", alt.ncButton, "google-assistant");
+  check("touch panel off", alt.touchPanel, false);
+  check("voice guidance off", alt.voiceGuidance, false);
+  check("optimizer running", Model.isOptimizerRunning(alt.optimizerState), true);
+  check("custom slot selected", Model.isCustomEqSlot(alt.eqPreset), true);
+
+  const bare = Model.parseStatus(JSON.stringify({ schema_version: 1, connected: true }));
+  check("volume unknown when not reported", bare.volume, Model.LEVEL_UNKNOWN);
+  check("nc button unknown when not reported", bare.ncButton, "unknown");
+  const wild = Model.parseStatus(JSON.stringify({ schema_version: 1, connected: true, volume: 99, volume_max: 30, nc_button: "siri" }));
+  check("volume clamps to max", wild.volume, 30);
+  check("unknown nc button stays unknown", wild.ncButton, "unknown");
+
+  check("custom slots", Model.EQ_CUSTOM_SLOTS, ["custom", "user1", "user2"]);
+  check("preset is not a custom slot", Model.isCustomEqSlot("bass"), false);
+  check("band labels", Model.EQ_BAND_LABELS, ["400", "1k", "2.5k", "6.3k", "16k"]);
+  check("Custom 1 label", Model.eqPresetButtonLabel("user1"), "Custom 1");
+  check("Manual label", Model.eqPresetButtonLabel("custom"), "Manual");
+
+  check("optimizer: never run", Model.optimizerDescription("idle", ""), "Tunes noise cancelling to your fit. Wear the headset first.");
+  check("optimizer: idle with history", Model.optimizerDescription("idle", "1.0"), "Last run measured 1.0 atm. Wear the headset, then optimize.");
+  check("optimizer: fit", Model.optimizerDescription("measuring-fit", ""), "Measuring how the headset fits…");
+  check("optimizer: done", Model.optimizerDescription("done", "0.9"), "Optimized · 0.9 atm");
+  check("optimizer running states", ["measuring-fit", "measuring-pressure", "optimizing"].map(Model.isOptimizerRunning), [true, true, true]);
+  check("optimizer not running", ["idle", "done"].map(Model.isOptimizerRunning), [false, false]);
+
+  check("nc button name", Model.ncButtonName("google-assistant"), "Google Assistant");
+  check("nc button description", Model.ncButtonDescription("ambient"), "The NC/AMBIENT button switches noise control.");
+  check("auto power off labels", Model.AUTO_POWER_OFF_VALUES.map(Model.autoPowerOffLabel), ["5 min", "30 min", "1 hr", "3 hr", "Never"]);
+  check("voice guidance on", Model.voiceGuidanceDescription(true, "English"), "Spoken prompts in English");
+  check("voice guidance off", Model.voiceGuidanceDescription(false, "English"), "Spoken prompts are off");
+  check("volume fraction", Model.volumeFraction(15, 30), 0.5);
+  check("noise button labels", Model.NOISE_MODES.map(Model.noiseModeButtonLabel), ["ANC", "Wind", "Ambient", "Off"]);
+});
+
 // ---------------------------------------------------------------------------
 console.log(`\nSummary: ${passed} passed, ${failed} failed`);
 if (failed > 0) {

@@ -1,5 +1,5 @@
 // plugin/Service.qml
-// Reactive singleton / manager service for Sony WH-1000XM3 headphones.
+// Reactive state and command dispatch for Sony WH-1000XM3 headphones.
 import QtQuick
 import Quickshell
 import Quickshell.Io
@@ -23,100 +23,103 @@ Item {
     return base + "/sony-xm3/status.json"
   }
 
-  // Reactive state properties
-  property bool ok: false
-  property string lastError: ""
-  property int schemaVersion: 0
-  property bool schemaTooNew: false
-  property bool connected: false
-  property string deviceName: ""
-  property int batteryLevel: Model.LEVEL_UNKNOWN
-  property bool batteryCharging: false
-  property string codec: ""
-  property int ambientMaxLevel: Model.STEP_AMBIENT_MAX_DEFAULT
-  property var eqCustomBands: [0, 0, 0, 0, 0]
-  property int clearBass: 0
-  property string autoPowerOff: "unknown"
-  property string _realConnectionMode: "unknown"
+  // ---------------------------------------------------------------------------
+  // State
+  //
+  // `_real` is the last status the daemon wrote. `_pending` holds values the
+  // user just chose, each with its own expiry, so a control reflects a click
+  // immediately and falls back to the truth if the headset never confirms it.
+  // Both objects are replaced rather than mutated so that bindings notice.
+  // ---------------------------------------------------------------------------
+  property var _real: Model.defaultStatus()
+  property var _pending: ({})
 
-  // Real internal states reported by daemon
-  property string _realNoiseMode: Model.NOISE_UNKNOWN
-  property int _realAmbientSoundLevel: 0
-  property bool _realVoicePassthrough: false
-  property string _realEqPreset: Model.EQ_OFF
-  property bool _realDseeHx: false
-  property bool dseeHxActive: false
-  property string _realSurround: Model.SURROUND_OFF
-  property string _realSoundPosition: Model.SOUND_POSITION_OFF
+  function _value(key) {
+    return _pending.hasOwnProperty(key) ? _pending[key].value : _real[key]
+  }
 
-  // Optimistic desired states
-  property string _desiredNoiseMode: ""
-  property int _desiredAmbientLevel: -1
-  property var _desiredVoicePassthrough: null
-  property string _desiredEqPreset: ""
-  property var _desiredDsee: null
-  property string _desiredConnectionMode: ""
-  property string _desiredSurround: ""
-  property string _desiredSoundPosition: ""
+  function _setPending(key, value, ttlMs) {
+    var next = Object.assign({}, _pending)
+    next[key] = { value: value, until: Date.now() + (ttlMs || 4000) }
+    _pending = next
+    pendingTimer.start()
+  }
 
-  // Exposed effective properties (optimistic value if pending, otherwise real value)
-  readonly property string noiseMode: _desiredNoiseMode !== "" ? _desiredNoiseMode : _realNoiseMode
-  readonly property int ambientSoundLevel: _desiredAmbientLevel !== -1 ? _desiredAmbientLevel : _realAmbientSoundLevel
-  readonly property bool voicePassthrough: _desiredVoicePassthrough !== null ? _desiredVoicePassthrough : _realVoicePassthrough
-  readonly property string eqPreset: _desiredEqPreset !== "" ? _desiredEqPreset : _realEqPreset
-  readonly property bool dseeHx: _desiredDsee !== null ? _desiredDsee : _realDseeHx
-  readonly property string surround: _desiredSurround !== "" ? _desiredSurround : _realSurround
-  readonly property string soundPosition: _desiredSoundPosition !== "" ? _desiredSoundPosition : _realSoundPosition
-  readonly property string connectionMode: _desiredConnectionMode !== "" ? _desiredConnectionMode : _realConnectionMode
+  // Report-only fields: nothing the user sets directly.
+  readonly property bool ok: _real.ok === true
+  readonly property string lastErrorFromStatus: _real.lastError || ""
+  readonly property bool schemaTooNew: _real.schemaTooNew === true
+  readonly property bool connected: _real.connected === true
+  readonly property string deviceName: _real.deviceName || ""
+  readonly property int batteryLevel: _real.batteryLevel
+  readonly property bool batteryCharging: _real.batteryCharging === true
+  readonly property string codec: _real.codec || ""
+  readonly property string firmwareVersion: _real.firmwareVersion || ""
+  readonly property int ambientMaxLevel: _real.ambientMaxLevel || Model.STEP_AMBIENT_MAX_DEFAULT
+  readonly property bool dseeHxActive: _real.dseeHxActive === true
+  readonly property string optimizerPressure: _real.optimizerPressure || ""
+  readonly property int volumeMax: _real.volumeMax || 30
+  readonly property string voiceGuidanceLanguage: _real.voiceGuidanceLanguage || ""
 
-  // EQ and surround are unavailable while the headset streams LDAC.
+  // Settable fields: pending value if there is one, otherwise the daemon's.
+  readonly property string noiseMode: _value("noiseMode")
+  readonly property int ambientSoundLevel: _value("ambientSoundLevel")
+  readonly property bool voicePassthrough: _value("voicePassthrough") === true
+  readonly property string connectionMode: _value("connectionMode")
+  readonly property string eqPreset: _value("eqPreset")
+  readonly property var eqCustomBands: _value("eqCustomBands") || [0, 0, 0, 0, 0]
+  readonly property int clearBass: _value("clearBass") || 0
+  readonly property string surround: _value("surround")
+  readonly property string soundPosition: _value("soundPosition")
+  readonly property bool dseeHx: _value("dseeHx") === true
+  readonly property string optimizerState: _value("optimizerState")
+  readonly property int volume: _value("volume")
+  readonly property string ncButton: _value("ncButton")
+  readonly property bool touchPanel: _value("touchPanel") === true
+  readonly property bool voiceGuidance: _value("voiceGuidance") === true
+  readonly property string autoPowerOff: _value("autoPowerOff")
+
+  // Derived rules.
   readonly property bool dspAvailable: Model.dspAvailable(connectionMode)
-
-  // Focus on Voice only exists in the upper part of the ambient range.
   readonly property bool voiceFocusAvailable: Model.isVoiceFocusAvailable(noiseMode, ambientSoundLevel)
+  readonly property bool optimizerRunning: Model.isOptimizerRunning(optimizerState)
+  readonly property bool customEqSelected: Model.isCustomEqSlot(eqPreset)
 
-  // 4000ms optimistic state settlement timer
+  property string lastError: ""
+
+  // Drops pending values once they expire; idle whenever nothing is pending.
   Timer {
-    id: settleTimer
-    interval: 4000
-    repeat: false
+    id: pendingTimer
+    interval: 500
+    repeat: true
     onTriggered: {
-      root.clearOptimisticOverrides()
-      interval = 4000
+      var now = Date.now()
+      var next = {}
+      var kept = 0
+      for (var key in root._pending) {
+        if (root._pending[key].until > now) {
+          next[key] = root._pending[key]
+          kept++
+        }
+      }
+      root._pending = next
+      if (kept === 0) stop()
     }
   }
 
-  function clearOptimisticOverrides() {
-    _desiredNoiseMode = ""
-    _desiredAmbientLevel = -1
-    _desiredVoicePassthrough = null
-    _desiredEqPreset = ""
-    _desiredDsee = null
-    _desiredConnectionMode = ""
-    _desiredSurround = ""
-    _desiredSoundPosition = ""
-  }
-
-  function hasPendingOverrides() {
-    return _desiredNoiseMode !== "" || _desiredAmbientLevel !== -1 ||
-           _desiredVoicePassthrough !== null || _desiredEqPreset !== "" ||
-           _desiredDsee !== null || _desiredConnectionMode !== "" ||
-           _desiredSurround !== "" || _desiredSoundPosition !== ""
-  }
-
-  // Command dispatch queue
+  // ---------------------------------------------------------------------------
+  // Command dispatch: one sony-xm3-ctl process at a time, in order.
+  // ---------------------------------------------------------------------------
   property var commandQueue: []
 
   function runCommand(args) {
-    var cmd = [cliBinary].concat(args)
-    commandQueue.push(cmd)
+    commandQueue.push([cliBinary].concat(args))
     dispatchNext()
   }
 
   function dispatchNext() {
     if (ctlProcess.running || commandQueue.length === 0) return
-    var nextCmd = commandQueue.shift()
-    ctlProcess.command = nextCmd
+    ctlProcess.command = commandQueue.shift()
     ctlProcess.running = true
   }
 
@@ -128,15 +131,13 @@ Item {
     onExited: function(exitCode) {
       if (exitCode !== 0) {
         var err = String(ctlStderr.text || ctlStdout.text || "").trim()
-        if (err) {
-          root.lastError = Model.elideError(err)
-        }
+        if (err) root.lastError = Model.elideError(err)
       }
       dispatchNext()
     }
   }
 
-  // Reactive FileView watcher (zero periodic polling timers for file reading)
+  // Reactive FileView watcher (no polling).
   FileView {
     id: fileView
     path: root.statusPath
@@ -152,135 +153,130 @@ Item {
   }
 
   function applyStatus(raw) {
-    var content = raw
-    if (content === undefined || content === null) {
-      content = typeof fileView.text === "function" ? fileView.text() : (fileView.text || "")
+    var parsed = Model.parseStatus(raw)
+    _real = parsed
+
+    // A pending value the headset has now confirmed is no longer pending.
+    var next = {}
+    for (var key in _pending) {
+      if (JSON.stringify(parsed[key]) !== JSON.stringify(_pending[key].value)) {
+        next[key] = _pending[key]
+      }
     }
-    var parsed = Model.parseStatus(content)
-
-    ok = parsed.ok === true
-    lastError = parsed.lastError || ""
-    schemaVersion = parsed.schemaVersion || 0
-    schemaTooNew = parsed.schemaTooNew === true
-    connected = parsed.connected === true
-    deviceName = parsed.deviceName || ""
-    batteryLevel = parsed.batteryLevel !== undefined ? parsed.batteryLevel : Model.LEVEL_UNKNOWN
-    batteryCharging = parsed.batteryCharging === true
-    codec = parsed.codec || ""
-    ambientMaxLevel = parsed.ambientMaxLevel || Model.STEP_AMBIENT_MAX_DEFAULT
-    eqCustomBands = parsed.eqCustomBands || [0, 0, 0, 0, 0]
-    clearBass = parsed.clearBass !== undefined ? parsed.clearBass : 0
-    autoPowerOff = parsed.autoPowerOff || "unknown"
-    _realConnectionMode = parsed.connectionMode || "unknown"
-    dseeHxActive = parsed.dseeHxActive === true
-
-    _realNoiseMode = parsed.noiseMode || Model.NOISE_UNKNOWN
-    _realAmbientSoundLevel = parsed.ambientSoundLevel !== undefined ? parsed.ambientSoundLevel : 0
-    _realVoicePassthrough = parsed.voicePassthrough === true
-    _realEqPreset = parsed.eqPreset || Model.EQ_OFF
-    _realDseeHx = parsed.dseeHx === true
-    _realSurround = parsed.surround || Model.SURROUND_OFF
-    _realSoundPosition = parsed.soundPosition || Model.SOUND_POSITION_OFF
-
-    // Reconcile optimistic values with settled daemon updates
-    if (_desiredNoiseMode !== "" && _realNoiseMode === _desiredNoiseMode) _desiredNoiseMode = ""
-    if (_desiredAmbientLevel !== -1 && _realAmbientSoundLevel === _desiredAmbientLevel) _desiredAmbientLevel = -1
-    if (_desiredVoicePassthrough !== null && _realVoicePassthrough === _desiredVoicePassthrough) _desiredVoicePassthrough = null
-    if (_desiredEqPreset !== "" && _realEqPreset === _desiredEqPreset) _desiredEqPreset = ""
-    if (_desiredDsee !== null && _realDseeHx === _desiredDsee) _desiredDsee = null
-    if (_desiredConnectionMode !== "" && _realConnectionMode === _desiredConnectionMode) _desiredConnectionMode = ""
-    if (_desiredSurround !== "" && _realSurround === _desiredSurround) _desiredSurround = ""
-    if (_desiredSoundPosition !== "" && _realSoundPosition === _desiredSoundPosition) _desiredSoundPosition = ""
-
-    if (!hasPendingOverrides()) {
-      settleTimer.stop()
-    }
+    _pending = next
   }
 
+  // ---------------------------------------------------------------------------
+  // Setters
+  // ---------------------------------------------------------------------------
   function setNoiseMode(mode) {
-    if (Model.NOISE_MODES.indexOf(mode) === -1) return
-    _desiredNoiseMode = mode
-    // The step follows the mode, so predict it too — otherwise the slider jumps
-    // to the old value for the length of one status-file round trip.
-    if (mode === Model.NOISE_ANC) _desiredAmbientLevel = Model.STEP_ANC
-    else if (mode === Model.NOISE_WIND) _desiredAmbientLevel = Model.STEP_WIND
-    settleTimer.restart()
+    if (Model.NOISE_MODES.indexOf(mode) === -1 || optimizerRunning) return
+    _setPending("noiseMode", mode)
+    // The step follows the mode, so predict it too.
+    if (mode === Model.NOISE_ANC) _setPending("ambientSoundLevel", Model.STEP_ANC)
+    else if (mode === Model.NOISE_WIND) _setPending("ambientSoundLevel", Model.STEP_WIND)
     runCommand(["noise", mode])
   }
 
   function setAmbientLevel(level) {
+    if (optimizerRunning) return
     var clamped = Model.clamp(level, 0, ambientMaxLevel, 0)
-    _desiredAmbientLevel = clamped
-    _desiredNoiseMode = Model.stepToNoiseMode(clamped)
-    settleTimer.restart()
+    _setPending("ambientSoundLevel", clamped)
+    _setPending("noiseMode", Model.stepToNoiseMode(clamped))
     runCommand(["ambient-level", String(clamped)])
   }
 
   function setVoiceFocus(enabled) {
-    _desiredVoicePassthrough = enabled === true
-    settleTimer.restart()
+    _setPending("voicePassthrough", enabled === true)
     runCommand(["voice-focus", enabled ? "on" : "off"])
   }
 
+  function setConnectionMode(mode) {
+    if (Model.CONNECTION_MODES.indexOf(mode) === -1 || mode === connectionMode) return
+    // The headset drops and re-establishes audio while it switches.
+    _setPending("connectionMode", mode, 12000)
+    runCommand(["connection", mode])
+  }
+
   function setEqPreset(preset) {
-    if (!dspAvailable) return
-    if (Model.EQ_PRESETS.indexOf(preset) === -1 && preset !== "user1" && preset !== "user2") return
-    _desiredEqPreset = preset
-    settleTimer.restart()
+    if (Model.EQ_PRESETS.indexOf(preset) === -1 || !dspAvailable) return
+    _setPending("eqPreset", preset)
     runCommand(["eq", preset])
   }
 
-  function setEqCustom(b1, b2, b3, b4, b5, cb) {
-    if (!dspAvailable) return
-    _desiredEqPreset = Model.EQ_CUSTOM
-    settleTimer.restart()
-    runCommand([
-      "eq", "custom",
-      String(Model.clamp(b1, -10, 10, 0)),
-      String(Model.clamp(b2, -10, 10, 0)),
-      String(Model.clamp(b3, -10, 10, 0)),
-      String(Model.clamp(b4, -10, 10, 0)),
-      String(Model.clamp(b5, -10, 10, 0)),
-      String(Model.clamp(cb, -10, 10, 0))
-    ])
-  }
-
-  function setDsee(enabled) {
-    _desiredDsee = enabled === true
-    settleTimer.restart()
-    runCommand(["dsee", enabled ? "on" : "off"])
+  // Sets the bands of a custom slot (Manual, Custom 1 or Custom 2).
+  function setEqBands(slot, bands, cb) {
+    if (!Model.isCustomEqSlot(slot) || !dspAvailable) return
+    var clean = []
+    for (var i = 0; i < 5; i++) clean.push(Model.clamp(bands[i], -10, 10, 0))
+    var clearBassValue = Model.clamp(cb, -10, 10, 0)
+    _setPending("eqPreset", slot)
+    _setPending("eqCustomBands", clean)
+    _setPending("clearBass", clearBassValue)
+    runCommand(["eq", slot].concat(clean.map(String)).concat([String(clearBassValue)]))
   }
 
   function setSurround(preset) {
-    if (!dspAvailable) return
-    if (Model.SURROUND_PRESETS.indexOf(preset) === -1) return
-    _desiredSurround = preset
-    settleTimer.restart()
+    if (Model.SURROUND_PRESETS.indexOf(preset) === -1 || !dspAvailable) return
+    _setPending("surround", preset)
     runCommand(["surround", preset])
   }
 
   function setSoundPosition(position) {
-    if (!dspAvailable) return
-    if (Model.SOUND_POSITIONS.indexOf(position) === -1) return
-    _desiredSoundPosition = position
-    settleTimer.restart()
+    if (Model.SOUND_POSITIONS.indexOf(position) === -1 || !dspAvailable) return
+    _setPending("soundPosition", position)
     runCommand(["sound-position", position])
+  }
+
+  function setDsee(enabled) {
+    _setPending("dseeHx", enabled === true)
+    runCommand(["dsee", enabled ? "on" : "off"])
+  }
+
+  function startOptimizer() {
+    if (optimizerRunning) return
+    // Measuring takes about a dozen seconds; progress arrives as notifications.
+    _setPending("optimizerState", "measuring-fit", 2500)
+    runCommand(["optimizer", "start"])
+  }
+
+  function cancelOptimizer() {
+    _setPending("optimizerState", "idle", 2500)
+    runCommand(["optimizer", "cancel"])
+  }
+
+  function setVolume(level) {
+    var clamped = Model.clamp(level, 0, volumeMax, 0)
+    _setPending("volume", clamped)
+    runCommand(["volume", String(clamped)])
+  }
+
+  function playback(action) {
+    if (Model.PLAYBACK_ACTIONS.indexOf(action) === -1) return
+    runCommand(["playback", action])
+  }
+
+  function setNcButton(button) {
+    if (Model.NC_BUTTONS.indexOf(button) === -1 || button === ncButton) return
+    // Reassigning the button can make the headset reconnect.
+    _setPending("ncButton", button, 12000)
+    runCommand(["nc-button", button])
+  }
+
+  function setTouchPanel(enabled) {
+    _setPending("touchPanel", enabled === true)
+    runCommand(["touch-panel", enabled ? "on" : "off"])
+  }
+
+  function setVoiceGuidance(enabled) {
+    _setPending("voiceGuidance", enabled === true)
+    runCommand(["voice-guidance", enabled ? "on" : "off"])
   }
 
   function setAutoPowerOff(value) {
     if (Model.AUTO_POWER_OFF_VALUES.indexOf(value) === -1) return
+    _setPending("autoPowerOff", value)
     runCommand(["auto-power-off", value])
-  }
-
-  function setConnectionMode(mode) {
-    if (Model.CONNECTION_MODES.indexOf(mode) === -1) return
-    if (mode === connectionMode) return
-    _desiredConnectionMode = mode
-    // The headset drops and re-establishes audio while it switches, so give
-    // the optimistic value longer than usual to be confirmed.
-    settleTimer.interval = 10000
-    settleTimer.restart()
-    runCommand(["connection", mode])
   }
 
   function cycleNoiseMode() {
@@ -291,7 +287,5 @@ Item {
     fileView.reload()
   }
 
-  Component.onCompleted: {
-    fileView.reload()
-  }
+  Component.onCompleted: fileView.reload()
 }

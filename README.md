@@ -32,12 +32,19 @@ checks for an adapter and a paired headset and warns you if either is missing.
 - 🔋 **Live battery & codec** — percentage, charging state, and the negotiated codec (LDAC, aptX HD, aptX, AAC, SBC).
 - 🎧 **Noise control** — Noise Cancelling, Wind Noise Reduction, Ambient Sound, and Off.
 - 🔊 **Ambient sound slider** — the XM3's full passthrough range, with Focus on Voice.
-- 🎛️ **Equalizer** — the nine presets plus Manual (5 bands + Clear Bass) and the two saved user slots.
+- 🎛️ **Equalizer** — all twelve presets, with band sliders (400 Hz–16 kHz + Clear Bass) for Manual, Custom 1 and Custom 2.
 - 📶 **Bluetooth priority** — LDAC ("sound quality") or stable connection, switchable from the panel.
 - 🎚️ **DSEE HX** — the XM3's upscaling, with an honest "on but idle" state (it switches itself off on LDAC).
 - 🎪 **Surround (VPT)** — Outdoor Festival, Arena, Concert Hall, Club.
 - 🧭 **Sound position** — front, front L/R, rear L/R.
+- 🎯 **NC Optimizer** — tunes noise cancelling to your fit and the air pressure, with live progress.
+- 🔈 **Headset volume and playback** — the headset's own volume, plus play, pause and skip.
+- 🔘 **NC/AMBIENT button** — make the left-earcup button switch noise control, or talk to Google Assistant or Alexa.
+- 👆 **Touch sensor control panel** — turn the right-earcup swipe controls on or off.
+- 🗣️ **Voice guidance** — spoken prompts on or off.
+- ℹ️ **Firmware version**, read from the headset.
 - ⏻ **Auto power off** — 5 / 30 / 60 / 180 min, or disabled.
+- 🗂️ **Two tabs** — *Sound* and *Device*, so the panel stays short.
 - ⌨️ **Keyboard navigation** — vim-style (`h`/`j`/`k`/`l`, `Enter`, `Esc`) in the panel.
 - 💻 **CLI (`sony-xm3-ctl`)** — everything the panel does, scriptable.
 - ⚡ **No polling** — native BlueZ RFCOMM plus a file-watched state file.
@@ -156,9 +163,10 @@ sony-xm3-ctl noise off                 # noise processing off
 sony-xm3-ctl ambient-level 12          # same axis, directly
 sony-xm3-ctl voice-focus on            # Focus on Voice (step 2+)
 
-# Equalizer
+# Equalizer (needs Stable priority; LDAC blocks it)
 sony-xm3-ctl eq vocal
-sony-xm3-ctl eq custom 0 2 4 2 0 5     # 5 bands then Clear Bass, each -10..10
+sony-xm3-ctl eq user1                  # select Custom 1 (custom = Manual, user2 = Custom 2)
+sony-xm3-ctl eq custom 0 2 4 2 0 5     # set Manual's 5 bands then Clear Bass, each -10..10
 
 # Everything else
 sony-xm3-ctl dsee on                   # DSEE HX
@@ -166,6 +174,18 @@ sony-xm3-ctl surround concert          # off|outdoor|arena|concert|club
 sony-xm3-ctl sound-position front      # off|front-left|front-right|front|rear-left|rear-right
 sony-xm3-ctl auto-power-off 180min     # off|5min|30min|60min|180min
 sony-xm3-ctl connection quality        # quality|stable
+
+# Device
+sony-xm3-ctl optimizer start           # NC Optimizer: wear the headset, it plays test tones
+sony-xm3-ctl volume 15                 # headset volume, 0..30
+sony-xm3-ctl playback pause            # play|pause|next|previous
+sony-xm3-ctl nc-button ambient         # ambient|google-assistant|alexa
+sony-xm3-ctl touch-panel on
+sony-xm3-ctl voice-guidance off
+
+# Protocol exploration: the reply appears in the daemon's journal
+sony-xm3-ctl raw 04 02                 # table-1 payload (this one asks for the firmware version)
+sony-xm3-ctl raw2 46 01 01             # table-2 payload
 ```
 
 Exit codes: `0` success, `1` bad arguments or a daemon error, `2` daemon
@@ -234,11 +254,13 @@ explanation.
 PC with [EasyEffects](https://github.com/wwmm/easyeffects) — that applies before
 the audio is encoded, so you keep LDAC.
 
-### Getting the full 990 kbps
+### LDAC bitrate: leave it adaptive
 
-PipeWire runs LDAC adaptively by default and drops to 660 or 330 kbps whenever it
-judges the link marginal. To pin it at the top rate for this headset, drop a file
-in `~/.config/wireplumber/wireplumber.conf.d/`:
+PipeWire runs LDAC adaptively by default: up to 990 kbps, stepping down to 660 or
+330 kbps when the link is marginal. You can pin it at 990 kbps — but on the
+machine this was developed on, that produced occasional glitches where adaptive
+simply dropped a step for a moment. Adaptive is the better default. If you want
+to try pinning it anyway, drop this in `~/.config/wireplumber/wireplumber.conf.d/`:
 
 ```
 monitor.bluez.rules = [
@@ -257,6 +279,23 @@ Combo WiFi/Bluetooth cards (the Intel AX210 and friends) share one 2.4 GHz
 radio. A WiFi interface that is enabled but not connected makes NetworkManager
 scan for networks every few minutes, and every scan briefly takes the radio away
 from your audio. If you are on ethernet, `nmcli radio wifi off` fixes it.
+
+---
+
+## Not included, and why
+
+Three things Sony's app does that this deliberately doesn't:
+
+- **Adaptive Sound Control.** On the XM3 this is a *phone* feature: the app reads
+  the phone's motion sensors to decide whether you are sitting, walking or on a
+  train, then sends ordinary noise-control commands. The headset side is only a
+  flag. On a stationary desktop there is nothing to detect.
+- **Voice guidance language.** Switching language downloads a voice pack and
+  streams it into the headset — the same kind of transfer as a firmware update.
+  On/off is supported; the language is shown but not changed here.
+- **Firmware updates.** A failed transfer can leave the headset unusable, and
+  the update protocol is undocumented. Use Sony's phone app. (The WH-1000XM3's
+  last firmware is 4.5.2, from May 2020 — the panel shows your version.)
 
 ---
 

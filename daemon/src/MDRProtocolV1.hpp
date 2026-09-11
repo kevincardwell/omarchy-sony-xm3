@@ -89,6 +89,40 @@ enum class Command : uint8_t {
     EQEBB_SET_PARAM             = 0x58,
     EQEBB_NTFY_PARAM            = 0x59,
 
+    SENSE_GET_CAPABILITY        = 0x70,
+    SENSE_RET_CAPABILITY        = 0x71,
+
+    OPT_GET_CAPABILITY          = 0x80,
+    OPT_RET_CAPABILITY          = 0x81,
+    OPT_GET_STATUS              = 0x82,
+    OPT_RET_STATUS              = 0x83,
+    OPT_SET_STATUS              = 0x84,
+    OPT_NTFY_STATUS             = 0x85,
+    OPT_GET_PARAM               = 0x86,
+    OPT_RET_PARAM               = 0x87,
+    OPT_NTFY_PARAM              = 0x89,
+
+    ALERT_SET_PARAM             = 0x98,
+    ALERT_NTFY_PARAM            = 0x99,
+
+    PLAY_GET_CAPABILITY         = 0xA0,
+    PLAY_RET_CAPABILITY         = 0xA1,
+    PLAY_GET_STATUS             = 0xA2,
+    PLAY_RET_STATUS             = 0xA3,
+    PLAY_SET_STATUS             = 0xA4,
+    PLAY_NTFY_STATUS            = 0xA5,
+    PLAY_GET_PARAM              = 0xA6,
+    PLAY_RET_PARAM              = 0xA7,
+    PLAY_SET_PARAM              = 0xA8,
+    PLAY_NTFY_PARAM             = 0xA9,
+
+    GENERAL_SETTING_GET_CAPABILITY = 0xD0,
+    GENERAL_SETTING_RET_CAPABILITY = 0xD1,
+    GENERAL_SETTING_GET_PARAM   = 0xD6,
+    GENERAL_SETTING_RET_PARAM   = 0xD7,
+    GENERAL_SETTING_SET_PARAM   = 0xD8,
+    GENERAL_SETTING_NTFY_PARAM  = 0xD9,
+
     NCASM_GET_CAPABILITY        = 0x60,
     NCASM_RET_CAPABILITY        = 0x61,
     NCASM_GET_PARAM             = 0x66,
@@ -118,6 +152,28 @@ enum class SystemInquiredType  : uint8_t {
     NO_USE = 0x00, VIBRATOR = 0x01, POWER_SAVING_MODE = 0x02,
     CONTROL_BY_WEARING = 0x03, AUTO_POWER_OFF = 0x04
 };
+
+// Table 2 (sent as DATA_MDR_NO2). Its command bytes collide with table 1's,
+// which is why these live in their own enum and parser.
+enum class CommandT2 : uint8_t {
+    VOICE_GUIDANCE_GET_CAPABILITY = 0x40,
+    VOICE_GUIDANCE_RET_CAPABILITY = 0x41,
+    VOICE_GUIDANCE_GET_PARAM      = 0x46,
+    VOICE_GUIDANCE_RET_PARAM      = 0x47,
+    VOICE_GUIDANCE_SET_PARAM      = 0x48,
+    VOICE_GUIDANCE_NTFY_PARAM     = 0x49
+};
+
+// General settings are generic slots; on the XM3 the headset names them
+// ASSIGNABLE_KEY_SETTING (0xD1, a list) and TOUCH_PANEL_SETTING (0xD2, on/off).
+inline constexpr uint8_t kGsNcButton  = 0xD1;
+inline constexpr uint8_t kGsTouchPanel = 0xD2;
+inline constexpr uint8_t kGsTypeBoolean = 0x01;
+inline constexpr uint8_t kGsTypeList    = 0x02;
+
+// ALERT_NTFY_PARAM message types the XM3 can raise.
+inline constexpr uint8_t kAlertConnectionModeChange = 0x01;
+inline constexpr uint8_t kAlertKeyAssignChange      = 0x02;
 
 // NC/ASM sub-fields.
 enum class NcAsmEffect       : uint8_t { OFF = 0x00, ON = 0x01, ADJUST_IN_PROGRESS = 0x10, ADJUST_COMPLETE = 0x11 };
@@ -186,6 +242,24 @@ enum class AutoPowerOff : uint8_t {
     UNKNOWN       = 0xFF
 };
 
+// What the NC/AMBIENT button on the left earcup does. Index order is the
+// headset's own candidate list (captured from GENERAL_SETTING_RET_CAPABILITY).
+enum class NcButton : uint8_t {
+    AMBIENT_SOUND_CONTROL = 0x00,
+    GOOGLE_ASSISTANT      = 0x01,
+    AMAZON_ALEXA          = 0x02,
+    UNKNOWN               = 0xFF
+};
+
+// PLAY_SET_STATUS control values used for the playback buttons.
+enum class PlaybackControl : uint8_t {
+    PAUSE    = 0x01,
+    NEXT     = 0x02,  // TRACK_UP
+    PREVIOUS = 0x03,  // TRACK_DOWN
+    PLAY     = 0x07,
+    UNKNOWN  = 0xFF
+};
+
 // Bluetooth link preference (LDAC bitrate priority).
 enum class ConnectionMode : uint8_t {
     SOUND_QUALITY = 0x00,
@@ -225,6 +299,17 @@ struct HeadphoneState {
     std::string auto_power_off = "unknown";
     std::string connection_mode = "unknown"; // "quality" | "stable"
     std::string codec = "";             // SBC / AAC / LDAC / aptX / aptX HD
+    std::string firmware_version = "";  // as reported by CONNECT_RET_DEVICE_INFO
+    // NC Optimizer: idle | measuring-fit | measuring-pressure | optimizing | done
+    std::string optimizer_state = "idle";
+    std::string optimizer_pressure = "";  // "0.7".."1.0" atm; empty = never measured
+    int volume = -1;                    // headset volume, 0..volume_max; -1 = unknown
+    int volume_max = 30;                // from PLAY_RET_CAPABILITY
+    std::string nc_button = "unknown";  // ambient | google-assistant | alexa
+    bool touch_panel = true;
+    bool voice_guidance = true;
+    std::string voice_guidance_language = "";
+    std::string model_name = "";        // as reported by the headset itself
     int64_t last_updated = 0;
 
     [[nodiscard]] std::string toJson() const;
@@ -278,12 +363,21 @@ std::vector<uint8_t> serializeNcAsm(bool enabled, uint8_t step, bool voiceFocus,
 std::vector<uint8_t> serializeNoiseMode(NoiseMode mode, uint8_t ambientLevel = 0, bool voiceFocus = false, uint8_t seq = 0);
 std::vector<uint8_t> serializeAmbientLevel(uint8_t level, bool voiceFocus = false, uint8_t seq = 0);
 std::vector<uint8_t> serializeEqPreset(EqPreset preset, uint8_t seq = 0);
-std::vector<uint8_t> serializeCustomEq(const std::array<int, 5>& bands, int clearBass, uint8_t seq = 0);
+std::vector<uint8_t> serializeCustomEq(const std::array<int, 5>& bands, int clearBass, uint8_t seq = 0,
+                                       EqPreset slot = EqPreset::CUSTOM);
 std::vector<uint8_t> serializeDsee(bool enabled, uint8_t seq = 0);
 std::vector<uint8_t> serializeSurround(SurroundPreset preset, uint8_t seq = 0);
 std::vector<uint8_t> serializeSoundPosition(SoundPosition position, uint8_t seq = 0);
 std::vector<uint8_t> serializeAutoPowerOff(AutoPowerOff timer, uint8_t seq = 0);
 std::vector<uint8_t> serializeConnectionMode(ConnectionMode mode, uint8_t seq = 0);
+std::vector<uint8_t> serializeOptimizer(bool start, uint8_t seq = 0);
+std::vector<uint8_t> serializeVolume(uint8_t volume, uint8_t seq = 0);
+std::vector<uint8_t> serializePlayback(PlaybackControl control, uint8_t seq = 0);
+std::vector<uint8_t> serializeNcButton(NcButton button, uint8_t seq = 0);
+std::vector<uint8_t> serializeTouchPanel(bool enabled, uint8_t seq = 0);
+std::vector<uint8_t> serializeVoiceGuidance(bool enabled, uint8_t seq = 0);   // table 2
+// Answer to an ALERT_NTFY_PARAM "proceed?" prompt.
+std::vector<uint8_t> serializeAlertReply(uint8_t messageType, bool proceed, uint8_t seq = 0);
 
 // ---------------------------------------------------------------------------
 // Session handshake (Host -> XM3)
@@ -294,6 +388,13 @@ std::vector<uint8_t> serializeConnectionMode(ConnectionMode mode, uint8_t seq = 
 std::vector<uint8_t> serializeQueryProtocolInfo(uint8_t seq = 0);
 std::vector<uint8_t> serializeQueryCapabilityInfo(uint8_t seq = 0);
 std::vector<uint8_t> serializeQuerySupportFunction(uint8_t seq = 0);
+std::vector<uint8_t> serializeQueryModelName(uint8_t seq = 0);
+std::vector<uint8_t> serializeQueryFirmwareVersion(uint8_t seq = 0);
+
+// Wraps an arbitrary payload as a DATA_MDR frame. For protocol exploration
+// (`sony-xm3-ctl raw …`); the reply shows up in the daemon's log.
+std::vector<uint8_t> serializeRaw(std::span<const uint8_t> payload, uint8_t seq = 0);
+std::vector<uint8_t> serializeRawT2(std::span<const uint8_t> payload, uint8_t seq = 0);
 
 // ---------------------------------------------------------------------------
 // Query Serializers (Host -> XM3 initialization)
@@ -309,12 +410,23 @@ std::vector<uint8_t> serializeQuerySurround(uint8_t seq = 0);
 std::vector<uint8_t> serializeQuerySoundPosition(uint8_t seq = 0);
 std::vector<uint8_t> serializeQueryAutoPowerOff(uint8_t seq = 0);
 std::vector<uint8_t> serializeQueryConnectionMode(uint8_t seq = 0);
+std::vector<uint8_t> serializeQueryOptimizerStatus(uint8_t seq = 0);
+std::vector<uint8_t> serializeQueryOptimizerParam(uint8_t seq = 0);
+std::vector<uint8_t> serializeQueryPlaybackCapability(uint8_t seq = 0);
+std::vector<uint8_t> serializeQueryVolume(uint8_t seq = 0);
+std::vector<uint8_t> serializeQueryNcButton(uint8_t seq = 0);
+std::vector<uint8_t> serializeQueryTouchPanel(uint8_t seq = 0);
+std::vector<uint8_t> serializeQueryVoiceGuidance(uint8_t seq = 0);          // table 2
+std::vector<uint8_t> serializeQueryVoiceGuidanceLanguage(uint8_t seq = 0);  // table 2
 
 // ---------------------------------------------------------------------------
 // Inbound State Deserializer (XM3 -> Host)
 // ---------------------------------------------------------------------------
 // Parses an unpacked payload into HeadphoneState. Returns true if state was updated.
 bool parseInboundPayload(std::span<const uint8_t> payload, HeadphoneState& state);
+// Table 2 (DATA_MDR_NO2 frames). Its command bytes overlap table 1's, so it
+// must never be fed to parseInboundPayload.
+bool parseInboundPayloadT2(std::span<const uint8_t> payload, HeadphoneState& state);
 
 // ---------------------------------------------------------------------------
 // Enum <-> String Helpers
@@ -332,6 +444,11 @@ AutoPowerOff stringToAutoPowerOff(const std::string& str);
 std::string connectionModeToString(ConnectionMode mode);
 ConnectionMode stringToConnectionMode(const std::string& str);
 std::string codecToString(uint8_t codecByte);
+std::string ncButtonToString(NcButton button);
+NcButton stringToNcButton(const std::string& str);
+PlaybackControl stringToPlayback(const std::string& str);
+std::string optimizerStateToString(uint8_t status);
+std::string voiceGuidanceLanguageToString(uint8_t lang);
 
 } // namespace omarchy::sony::protocol
 

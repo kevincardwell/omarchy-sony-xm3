@@ -31,6 +31,11 @@ ENUM_SUBCOMMANDS = {
     "sound-position": ["off", "front-left", "front-right", "front", "rear-left", "rear-right"],
     "auto-power-off": ["off", "5min", "30min", "60min", "180min"],
     "connection": ["quality", "stable"],
+    "optimizer": ["start", "cancel"],
+    "playback": ["play", "pause", "next", "previous"],
+    "nc-button": ["ambient", "google-assistant", "alexa"],
+    "touch-panel": ["on", "off"],
+    "voice-guidance": ["on", "off"],
 }
 
 
@@ -139,7 +144,8 @@ def main():
         if len(remaining) < 2:
             sys.stderr.write("Error: 'eq' requires a preset or 'custom' with 6 parameters\n")
             sys.exit(1)
-        if remaining[1].lower() == "custom":
+        slot = remaining[1].lower()
+        if slot in ("custom", "manual", "user1", "user2") and len(remaining) > 2:
             if len(remaining) < 8:
                 sys.stderr.write("Error: 'eq custom' requires 5 bands and clear bass (6 integers between -10 and 10)\n")
                 sys.exit(1)
@@ -156,10 +162,11 @@ def main():
             except ValueError:
                 sys.stderr.write("Error: EQ parameters must be valid integers\n")
                 sys.exit(1)
-            cmd = f"eq custom " + " ".join(str(x) for x in bands) + f" {cb}"
+            cmd = f"eq {slot} " + " ".join(str(x) for x in bands) + f" {cb}"
         else:
             preset = remaining[1].lower()
-            valid_presets = ["off", "bright", "excited", "mellow", "relaxed", "vocal", "treble", "bass", "speech"]
+            valid_presets = ["off", "bright", "excited", "mellow", "relaxed", "vocal", "treble", "bass", "speech",
+                             "custom", "manual", "user1", "user2"]
             if preset not in valid_presets:
                 sys.stderr.write(f"Error: Unknown EQ preset '{preset}'\n")
                 sys.exit(1)
@@ -188,6 +195,23 @@ def main():
         else:
             sys.stderr.write(f"Error from daemon: {resp}\n")
             sys.exit(1)
+
+    elif subcmd == "volume":
+        try:
+            level = int(remaining[1]) if len(remaining) >= 2 else -1
+        except ValueError:
+            level = -1
+        if not (0 <= level <= 30):
+            sys.stderr.write("Error: 'volume' requires an integer between 0 and 30\n")
+            sys.exit(1)
+        code, resp = send_command(socket_path, f"volume {level}")
+        if code != 0:
+            sys.exit(code)
+        if resp.startswith("OK"):
+            print("OK")
+            sys.exit(0)
+        sys.stderr.write(f"Error from daemon: {resp}\n")
+        sys.exit(1)
 
     elif subcmd in ENUM_SUBCOMMANDS:
         allowed = ENUM_SUBCOMMANDS[subcmd]

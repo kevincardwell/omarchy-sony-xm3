@@ -443,7 +443,8 @@ bool StateEngine::setEqPreset(const std::string& preset) {
     return true;
 }
 
-bool StateEngine::setCustomEq(const std::array<int, 5>& bands, int clearBass) {
+bool StateEngine::setCustomEq(const std::array<int, 5>& bands, int clearBass, const std::string& slot) {
+    if (slot != "custom" && slot != "user1" && slot != "user2") return false;
     for (int b : bands) {
         if (b < -10 || b > 10) return false;
     }
@@ -452,7 +453,7 @@ bool StateEngine::setCustomEq(const std::array<int, 5>& bands, int clearBass) {
     std::string payloadJson;
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        state_.eq_preset = "custom";
+        state_.eq_preset = slot;
         state_.eq_custom_bands = bands;
         state_.clear_bass = clearBass;
         touchAndPublishLocked(payloadJson);

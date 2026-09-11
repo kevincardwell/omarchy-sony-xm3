@@ -58,6 +58,16 @@ std::string HeadphoneState::toJson() const {
        << "\"auto_power_off\":\"" << auto_power_off << "\","
        << "\"connection_mode\":\"" << connection_mode << "\","
        << "\"codec\":\"" << codec << "\","
+       << "\"firmware_version\":\"" << firmware_version << "\","
+       << "\"optimizer_state\":\"" << optimizer_state << "\","
+       << "\"optimizer_pressure\":\"" << optimizer_pressure << "\","
+       << "\"volume\":" << volume << ","
+       << "\"volume_max\":" << volume_max << ","
+       << "\"nc_button\":\"" << nc_button << "\","
+       << "\"touch_panel\":" << (touch_panel ? "true" : "false") << ","
+       << "\"voice_guidance\":" << (voice_guidance ? "true" : "false") << ","
+       << "\"voice_guidance_language\":\"" << voice_guidance_language << "\","
+       << "\"model_name\":\"" << model_name << "\","
        << "\"last_updated\":" << last_updated
        << "}";
     return ss.str();
@@ -305,7 +315,8 @@ std::vector<uint8_t> serializeEqPreset(EqPreset preset, uint8_t seq) {
     return packFrame(PacketType::DATA_MDR, seq, payload);
 }
 
-std::vector<uint8_t> serializeCustomEq(const std::array<int, 5>& bands, int clearBass, uint8_t seq) {
+std::vector<uint8_t> serializeCustomEq(const std::array<int, 5>& bands, int clearBass, uint8_t seq,
+                                       EqPreset slot) {
     auto encode = [](int v) -> uint8_t {
         return static_cast<uint8_t>(std::clamp(v, -10, 10) + 10);
     };
@@ -313,7 +324,8 @@ std::vector<uint8_t> serializeCustomEq(const std::array<int, 5>& bands, int clea
     std::vector<uint8_t> payload = {
         cmd(Command::EQEBB_SET_PARAM),
         static_cast<uint8_t>(EqEbbInquiredType::PRESET_EQ),
-        static_cast<uint8_t>(EqPreset::CUSTOM), // 0xA0 ("Manual" in the Sony app)
+        // 0xA0 is "Manual" in the Sony app; 0xA1/0xA2 are Custom 1 and 2.
+        static_cast<uint8_t>(slot == EqPreset::USER1 || slot == EqPreset::USER2 ? slot : EqPreset::CUSTOM),
         0x06, // 6 band steps follow: Clear Bass then the five bands
         encode(clearBass),
         encode(bands[0]),
@@ -384,6 +396,53 @@ std::vector<uint8_t> serializeConnectionMode(ConnectionMode mode, uint8_t seq) {
     return packFrame(PacketType::DATA_MDR, seq, payload);
 }
 
+std::vector<uint8_t> serializeOptimizer(bool start, uint8_t seq) {
+    // OPT_SET_STATUS / NC_OPTIMIZER / ENABLE / START(1) or CANCEL(0)
+    std::vector<uint8_t> payload = {cmd(Command::OPT_SET_STATUS), 0x01, 0x00,
+                                    static_cast<uint8_t>(start ? 0x01 : 0x00)};
+    return packFrame(PacketType::DATA_MDR, seq, payload);
+}
+
+std::vector<uint8_t> serializeVolume(uint8_t volume, uint8_t seq) {
+    // PLAY_SET_PARAM / PLAYBACK_CONTROLLER / VOLUME
+    std::vector<uint8_t> payload = {cmd(Command::PLAY_SET_PARAM), 0x01, 0x20, volume};
+    return packFrame(PacketType::DATA_MDR, seq, payload);
+}
+
+std::vector<uint8_t> serializePlayback(PlaybackControl control, uint8_t seq) {
+    // PLAY_SET_STATUS / PLAYBACK_CONTROLLER / ENABLE / control
+    std::vector<uint8_t> payload = {cmd(Command::PLAY_SET_STATUS), 0x01, 0x00,
+                                    static_cast<uint8_t>(control)};
+    return packFrame(PacketType::DATA_MDR, seq, payload);
+}
+
+std::vector<uint8_t> serializeNcButton(NcButton button, uint8_t seq) {
+    std::vector<uint8_t> payload = {cmd(Command::GENERAL_SETTING_SET_PARAM), kGsNcButton,
+                                    kGsTypeList, static_cast<uint8_t>(button)};
+    return packFrame(PacketType::DATA_MDR, seq, payload);
+}
+
+std::vector<uint8_t> serializeTouchPanel(bool enabled, uint8_t seq) {
+    // Boolean general settings use ON = 0x01 on the XM3 (the XM5 inverts it).
+    std::vector<uint8_t> payload = {cmd(Command::GENERAL_SETTING_SET_PARAM), kGsTouchPanel,
+                                    kGsTypeBoolean, static_cast<uint8_t>(enabled ? 0x01 : 0x00)};
+    return packFrame(PacketType::DATA_MDR, seq, payload);
+}
+
+std::vector<uint8_t> serializeVoiceGuidance(bool enabled, uint8_t seq) {
+    // Table 2: VOICE_GUIDANCE_SET_PARAM / VOICE_GUIDANCE_SETTING / ON_OFF
+    std::vector<uint8_t> payload = {static_cast<uint8_t>(CommandT2::VOICE_GUIDANCE_SET_PARAM), 0x01, 0x01,
+                                    static_cast<uint8_t>(enabled ? 0x01 : 0x00)};
+    return packFrame(PacketType::DATA_MDR_NO2, seq, payload);
+}
+
+std::vector<uint8_t> serializeAlertReply(uint8_t messageType, bool proceed, uint8_t seq) {
+    // ALERT_SET_PARAM / FIXED_MESSAGE / message / POSITIVE(1) or NEGATIVE(0)
+    std::vector<uint8_t> payload = {cmd(Command::ALERT_SET_PARAM), 0x01, messageType,
+                                    static_cast<uint8_t>(proceed ? 0x01 : 0x00)};
+    return packFrame(PacketType::DATA_MDR, seq, payload);
+}
+
 // ---------------------------------------------------------------------------
 // Query Serializers
 // ---------------------------------------------------------------------------
@@ -408,6 +467,22 @@ std::vector<uint8_t> serializeQueryCapabilityInfo(uint8_t seq) {
 std::vector<uint8_t> serializeQuerySupportFunction(uint8_t seq) {
     return query2(Command::CONNECT_GET_SUPPORT_FUNCTION,
                   static_cast<uint8_t>(CommonInquiredType::FIXED_VALUE), seq);
+}
+
+std::vector<uint8_t> serializeQueryModelName(uint8_t seq) {
+    return query2(Command::CONNECT_GET_DEVICE_INFO, 0x01 /* MODEL_NAME */, seq);
+}
+
+std::vector<uint8_t> serializeQueryFirmwareVersion(uint8_t seq) {
+    return query2(Command::CONNECT_GET_DEVICE_INFO, 0x02 /* FW_VERSION */, seq);
+}
+
+std::vector<uint8_t> serializeRaw(std::span<const uint8_t> payload, uint8_t seq) {
+    return packFrame(PacketType::DATA_MDR, seq, payload);
+}
+
+std::vector<uint8_t> serializeRawT2(std::span<const uint8_t> payload, uint8_t seq) {
+    return packFrame(PacketType::DATA_MDR_NO2, seq, payload);
 }
 
 std::vector<uint8_t> serializeQueryBattery(uint8_t seq) {
@@ -460,6 +535,41 @@ std::vector<uint8_t> serializeQueryAutoPowerOff(uint8_t seq) {
                   static_cast<uint8_t>(SystemInquiredType::AUTO_POWER_OFF), seq);
 }
 
+std::vector<uint8_t> serializeQueryOptimizerStatus(uint8_t seq) {
+    return query2(Command::OPT_GET_STATUS, 0x01, seq);
+}
+
+std::vector<uint8_t> serializeQueryOptimizerParam(uint8_t seq) {
+    return query2(Command::OPT_GET_PARAM, 0x01, seq);
+}
+
+std::vector<uint8_t> serializeQueryPlaybackCapability(uint8_t seq) {
+    return query2(Command::PLAY_GET_CAPABILITY, 0x01, seq);
+}
+
+std::vector<uint8_t> serializeQueryVolume(uint8_t seq) {
+    std::vector<uint8_t> payload = {cmd(Command::PLAY_GET_PARAM), 0x01, 0x20};
+    return packFrame(PacketType::DATA_MDR, seq, payload);
+}
+
+std::vector<uint8_t> serializeQueryNcButton(uint8_t seq) {
+    return query2(Command::GENERAL_SETTING_GET_PARAM, kGsNcButton, seq);
+}
+
+std::vector<uint8_t> serializeQueryTouchPanel(uint8_t seq) {
+    return query2(Command::GENERAL_SETTING_GET_PARAM, kGsTouchPanel, seq);
+}
+
+std::vector<uint8_t> serializeQueryVoiceGuidance(uint8_t seq) {
+    std::vector<uint8_t> payload = {static_cast<uint8_t>(CommandT2::VOICE_GUIDANCE_GET_PARAM), 0x01, 0x01};
+    return packFrame(PacketType::DATA_MDR_NO2, seq, payload);
+}
+
+std::vector<uint8_t> serializeQueryVoiceGuidanceLanguage(uint8_t seq) {
+    std::vector<uint8_t> payload = {static_cast<uint8_t>(CommandT2::VOICE_GUIDANCE_GET_PARAM), 0x01, 0x02};
+    return packFrame(PacketType::DATA_MDR_NO2, seq, payload);
+}
+
 std::vector<uint8_t> serializeQueryConnectionMode(uint8_t seq) {
     return query2(Command::AUDIO_GET_PARAM,
                   static_cast<uint8_t>(AudioInquiredType::CONNECTION_MODE), seq);
@@ -474,8 +584,26 @@ bool parseInboundPayload(std::span<const uint8_t> payload, HeadphoneState& state
     const uint8_t c = payload[0];
     bool updated = false;
 
+    // 0. Device info (CONNECT_RET_DEVICE_INFO): [0x05, type, len, ascii...]
+    if (c == cmd(Command::CONNECT_RET_DEVICE_INFO) && payload.size() >= 3) {
+        const size_t len = payload[2];
+        if (payload.size() >= 3 + len) {
+            std::string text;
+            for (size_t i = 0; i < len; ++i) {
+                const char ch = static_cast<char>(payload[3 + i]);
+                // Printable ASCII only: this goes straight into a JSON string.
+                if (ch >= 0x20 && ch < 0x7f && ch != '"' && ch != '\\') text.push_back(ch);
+            }
+            if (payload[1] == 0x01) {
+                state.model_name = text;
+                if (!text.empty()) state.device_name = text;
+                updated = true;
+            }
+            if (payload[1] == 0x02) { state.firmware_version = text; updated = true; }
+        }
+    }
     // 1. Battery level (COMMON_RET/NTFY_BATTERY_LEVEL)
-    if ((c == cmd(Command::COMMON_RET_BATTERY_LEVEL) ||
+    else if ((c == cmd(Command::COMMON_RET_BATTERY_LEVEL) ||
          c == cmd(Command::COMMON_NTFY_BATTERY_LEVEL)) && payload.size() >= 4) {
         if (payload[1] == static_cast<uint8_t>(BatteryInquiredType::BATTERY)) {
             state.battery_level = payload[2];
@@ -590,6 +718,76 @@ bool parseInboundPayload(std::span<const uint8_t> payload, HeadphoneState& state
               c == cmd(Command::SYSTEM_NTFY_PARAM)) && payload.size() >= 4) {
         if (payload[1] == static_cast<uint8_t>(SystemInquiredType::AUTO_POWER_OFF)) {
             state.auto_power_off = autoPowerOffToString(static_cast<AutoPowerOff>(payload[3]));
+            updated = true;
+        }
+    }
+
+    // 10. NC Optimizer progress (OPT_RET/NTFY_STATUS): [cmd, 0x01, status, optimizerStatus]
+    else if ((c == cmd(Command::OPT_RET_STATUS) ||
+              c == cmd(Command::OPT_NTFY_STATUS)) && payload.size() >= 4 && payload[1] == 0x01) {
+        state.optimizer_state = optimizerStateToString(payload[3]);
+        updated = true;
+    }
+    // 11. NC Optimizer result (OPT_RET/NTFY_PARAM):
+    //     [cmd, 0x01, personalType, personalValue, barometricType, barometricValue]
+    //     barometricValue 0x07..0x0A is the measured pressure, 0.7..1.0 atm.
+    else if ((c == cmd(Command::OPT_RET_PARAM) ||
+              c == cmd(Command::OPT_NTFY_PARAM)) && payload.size() >= 6 && payload[1] == 0x01) {
+        const uint8_t baro = payload[5];
+        if (payload[4] == 0x01 && baro >= 0x07 && baro <= 0x0A) {
+            state.optimizer_pressure = baro == 0x0A ? "1.0" : "0." + std::to_string(baro);
+        } else {
+            state.optimizer_pressure = "";
+        }
+        updated = true;
+    }
+    // 12. Playback capability (PLAY_RET_CAPABILITY): [cmd, 0x01, volumeSteps, ...]
+    else if (c == cmd(Command::PLAY_RET_CAPABILITY) && payload.size() >= 3 && payload[1] == 0x01) {
+        if (payload[2] > 0) {
+            state.volume_max = static_cast<int>(payload[2]) - 1;
+            updated = true;
+        }
+    }
+    // 13. Headset volume (PLAY_RET/NTFY_PARAM): [cmd, 0x01, 0x20 VOLUME, value]
+    else if ((c == cmd(Command::PLAY_RET_PARAM) ||
+              c == cmd(Command::PLAY_NTFY_PARAM)) && payload.size() >= 4 &&
+             payload[1] == 0x01 && payload[2] == 0x20) {
+        state.volume = std::min<int>(payload[3], state.volume_max);
+        updated = true;
+    }
+    // 14. General settings (GENERAL_SETTING_RET/NTFY_PARAM): [cmd, slot, type, value]
+    else if ((c == cmd(Command::GENERAL_SETTING_RET_PARAM) ||
+              c == cmd(Command::GENERAL_SETTING_NTFY_PARAM)) && payload.size() >= 4) {
+        if (payload[1] == kGsNcButton && payload[2] == kGsTypeList) {
+            state.nc_button = ncButtonToString(static_cast<NcButton>(payload[3]));
+            updated = true;
+        } else if (payload[1] == kGsTouchPanel && payload[2] == kGsTypeBoolean) {
+            state.touch_panel = (payload[3] == 0x01);
+            updated = true;
+        }
+    }
+
+    if (updated) {
+        state.connected = true;
+        state.last_updated = nowSeconds();
+    }
+    return updated;
+}
+
+bool parseInboundPayloadT2(std::span<const uint8_t> payload, HeadphoneState& state) {
+    if (payload.size() < 4) return false;
+    const uint8_t c = payload[0];
+    bool updated = false;
+
+    // Voice guidance (VOICE_GUIDANCE_RET/NTFY_PARAM): [cmd, 0x01, detail, value]
+    //   detail 0x01 = on/off, 0x02 = language
+    if ((c == static_cast<uint8_t>(CommandT2::VOICE_GUIDANCE_RET_PARAM) ||
+         c == static_cast<uint8_t>(CommandT2::VOICE_GUIDANCE_NTFY_PARAM)) && payload[1] == 0x01) {
+        if (payload[2] == 0x01) {
+            state.voice_guidance = (payload[3] == 0x01);
+            updated = true;
+        } else if (payload[2] == 0x02) {
+            state.voice_guidance_language = voiceGuidanceLanguageToString(payload[3]);
             updated = true;
         }
     }
@@ -734,6 +932,50 @@ ConnectionMode stringToConnectionMode(const std::string& str) {
     if (str == "quality") return ConnectionMode::SOUND_QUALITY;
     if (str == "stable")  return ConnectionMode::STABLE_LINK;
     return ConnectionMode::UNKNOWN;
+}
+
+std::string ncButtonToString(NcButton button) {
+    switch (button) {
+        case NcButton::AMBIENT_SOUND_CONTROL: return "ambient";
+        case NcButton::GOOGLE_ASSISTANT:      return "google-assistant";
+        case NcButton::AMAZON_ALEXA:          return "alexa";
+        default:                              return "unknown";
+    }
+}
+
+NcButton stringToNcButton(const std::string& str) {
+    if (str == "ambient")          return NcButton::AMBIENT_SOUND_CONTROL;
+    if (str == "google-assistant") return NcButton::GOOGLE_ASSISTANT;
+    if (str == "alexa")            return NcButton::AMAZON_ALEXA;
+    return NcButton::UNKNOWN;
+}
+
+PlaybackControl stringToPlayback(const std::string& str) {
+    if (str == "play")     return PlaybackControl::PLAY;
+    if (str == "pause")    return PlaybackControl::PAUSE;
+    if (str == "next")     return PlaybackControl::NEXT;
+    if (str == "previous") return PlaybackControl::PREVIOUS;
+    return PlaybackControl::UNKNOWN;
+}
+
+std::string optimizerStateToString(uint8_t status) {
+    switch (status) {
+        case 0x00: return "idle";
+        case 0x01: return "measuring-fit";
+        case 0x02: return "measuring-pressure";
+        case 0x10: return "optimizing";
+        case 0x11: return "done";
+        default:   return "idle";
+    }
+}
+
+std::string voiceGuidanceLanguageToString(uint8_t lang) {
+    static const char* names[] = {
+        "", "English", "French", "German", "Spanish", "Italian", "Portuguese", "Dutch",
+        "Swedish", "Finnish", "Russian", "Japanese", "Brazilian Portuguese", "Korean",
+        "Turkish", "Chinese"
+    };
+    return lang < sizeof(names) / sizeof(names[0]) ? names[lang] : "";
 }
 
 std::string codecToString(uint8_t codecByte) {

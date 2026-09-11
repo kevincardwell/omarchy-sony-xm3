@@ -1121,12 +1121,137 @@ void testCommandQueue() {
     TEST_ASSERT(q.busy(), "The queue moves on to the next command after dropping one");
     TEST_ASSERT_EQ(static_cast<int>(sent.back().payload[0]), 0x56, "The next command is the one queued behind it");
 
+    // --- A dragged slider: newest value replaces the one still waiting ------
+    q.reset();
+    sent.clear();
+    for (uint8_t v = 10; v <= 20; ++v) q.enqueue(serializeVolume(v), "volume", true);
+    TEST_ASSERT_EQ(sent.size(), static_cast<size_t>(1), "Only the first value goes out immediately");
+    TEST_ASSERT_EQ(q.queued(), static_cast<size_t>(1), "Ten later values collapse into one waiting command");
+    q.onFrame(PacketType::ACK, 1);
+    TEST_ASSERT_EQ(static_cast<int>(sent.back().payload[3]), 20, "The waiting command carries the newest value");
+
+    // Coalescing is opt-in: probes and queries all go out.
+    q.reset();
+    sent.clear();
+    q.enqueue(serializeRaw(std::vector<uint8_t>{0x10, 0x00}), "raw packet");
+    q.enqueue(serializeRaw(std::vector<uint8_t>{0x18, 0x00}), "raw packet");
+    q.enqueue(serializeRaw(std::vector<uint8_t>{0x66, 0x02}), "raw packet");
+    TEST_ASSERT_EQ(q.queued(), static_cast<size_t>(2), "Non-coalescing commands are all kept");
+
     // --- Reset on disconnect -------------------------------------------------
     q.reset();
     TEST_ASSERT(!q.busy() && q.queued() == 0, "reset() clears everything");
     TEST_ASSERT_EQ(static_cast<int>(q.nextSeq()), 0, "reset() restarts the sequence at 0");
 
     TEST_PASS("CommandQueue");
+}
+
+// ---------------------------------------------------------------------------
+// 13. Device features added from hardware probing (2026-09-11)
+// ---------------------------------------------------------------------------
+void testDeviceFeatures() {
+    TEST_CASE("DeviceFeatures");
+
+    auto t1 = [](const std::vector<uint8_t>& frame) {
+        auto f = unpackFrame(frame);
+        return f && f->type == PacketType::DATA_MDR ? f->payload : std::vector<uint8_t>{};
+    };
+    auto t2 = [](const std::vector<uint8_t>& frame) {
+        auto f = unpackFrame(frame);
+        return f && f->type == PacketType::DATA_MDR_NO2 ? f->payload : std::vector<uint8_t>{};
+    };
+    using V = std::vector<uint8_t>;
+
+    // --- Setters: every one of these was confirmed by a headset notification --
+    TEST_ASSERT(t1(serializeOptimizer(true)) == V({0x84, 0x01, 0x00, 0x01}), "Optimizer start");
+    TEST_ASSERT(t1(serializeOptimizer(false)) == V({0x84, 0x01, 0x00, 0x00}), "Optimizer cancel");
+    TEST_ASSERT(t1(serializeVolume(17)) == V({0xa8, 0x01, 0x20, 0x11}), "Volume 17");
+    TEST_ASSERT(t1(serializePlayback(PlaybackControl::PAUSE)) == V({0xa4, 0x01, 0x00, 0x01}), "Pause");
+    TEST_ASSERT(t1(serializePlayback(PlaybackControl::PLAY)) == V({0xa4, 0x01, 0x00, 0x07}), "Play");
+    TEST_ASSERT(t1(serializePlayback(PlaybackControl::NEXT)) == V({0xa4, 0x01, 0x00, 0x02}), "Next");
+    TEST_ASSERT(t1(serializeNcButton(NcButton::AMBIENT_SOUND_CONTROL)) == V({0xd8, 0xd1, 0x02, 0x00}), "NC button: noise control");
+    TEST_ASSERT(t1(serializeTouchPanel(false)) == V({0xd8, 0xd2, 0x01, 0x00}), "Touch panel off");
+    TEST_ASSERT(t1(serializeTouchPanel(true)) == V({0xd8, 0xd2, 0x01, 0x01}), "Touch panel on (ON = 0x01 on the XM3)");
+    TEST_ASSERT(t2(serializeVoiceGuidance(true)) == V({0x48, 0x01, 0x01, 0x01}), "Voice guidance is a table-2 frame");
+    TEST_ASSERT(t1(serializeVoiceGuidance(true)).empty(), "Voice guidance must not be sent as a table-1 frame");
+    TEST_ASSERT(t1(serializeAlertReply(kAlertKeyAssignChange, true)) == V({0x98, 0x01, 0x02, 0x01}), "Alert reply: proceed");
+
+    std::array<int, 5> bands = {1, 2, 3, 4, 5};
+    auto user1 = t1(serializeCustomEq(bands, 0, 0, EqPreset::USER1));
+    TEST_ASSERT_EQ(static_cast<int>(user1[2]), 0xa1, "Bands can be written to Custom 1");
+    auto manual = t1(serializeCustomEq(bands, 0));
+    TEST_ASSERT_EQ(static_cast<int>(manual[2]), 0xa0, "Default slot is Manual");
+
+    // --- Queries ---------------------------------------------------------------
+    TEST_ASSERT(t1(serializeQueryFirmwareVersion()) == V({0x04, 0x02}), "Firmware version query");
+    TEST_ASSERT(t1(serializeQueryModelName()) == V({0x04, 0x01}), "Model name query");
+    TEST_ASSERT(t1(serializeQueryOptimizerStatus()) == V({0x82, 0x01}), "Optimizer status query");
+    TEST_ASSERT(t1(serializeQueryOptimizerParam()) == V({0x86, 0x01}), "Optimizer result query");
+    TEST_ASSERT(t1(serializeQueryPlaybackCapability()) == V({0xa0, 0x01}), "Playback capability query");
+    TEST_ASSERT(t1(serializeQueryVolume()) == V({0xa6, 0x01, 0x20}), "Volume query");
+    TEST_ASSERT(t1(serializeQueryNcButton()) == V({0xd6, 0xd1}), "NC button query");
+    TEST_ASSERT(t1(serializeQueryTouchPanel()) == V({0xd6, 0xd2}), "Touch panel query");
+    TEST_ASSERT(t2(serializeQueryVoiceGuidance()) == V({0x46, 0x01, 0x01}), "Voice guidance query (table 2)");
+    TEST_ASSERT(t2(serializeQueryVoiceGuidanceLanguage()) == V({0x46, 0x01, 0x02}), "Voice language query (table 2)");
+
+    // --- Captured replies ----------------------------------------------------------
+    HeadphoneState s;
+    parseInboundPayload(V({0x05, 0x02, 0x05, '4', '.', '5', '.', '2'}), s);
+    TEST_ASSERT(s.firmware_version == "4.5.2", "Captured firmware version");
+    parseInboundPayload(V({0x05, 0x01, 0x0a, 'W', 'H', '-', '1', '0', '0', '0', 'X', 'M', '3'}), s);
+    TEST_ASSERT(s.model_name == "WH-1000XM3", "Captured model name");
+    TEST_ASSERT(s.device_name == "WH-1000XM3", "The headset's own model name becomes the display name");
+
+    parseInboundPayload(V({0x87, 0x01, 0x01, 0x01, 0x01, 0x0a}), s);
+    TEST_ASSERT(s.optimizer_pressure == "1.0", "Captured optimizer result: 1.0 atm");
+    parseInboundPayload(V({0x87, 0x01, 0x01, 0x01, 0x01, 0x08}), s);
+    TEST_ASSERT(s.optimizer_pressure == "0.8", "Barometric value 0x08 is 0.8 atm");
+    parseInboundPayload(V({0x85, 0x01, 0x01, 0x01}), s);
+    TEST_ASSERT(s.optimizer_state == "measuring-fit", "Captured optimizer progress: measuring fit");
+    parseInboundPayload(V({0x85, 0x01, 0x00, 0x00}), s);
+    TEST_ASSERT(s.optimizer_state == "idle", "Captured optimizer cancel: idle");
+
+    parseInboundPayload(V({0xa1, 0x01, 0x1f, 0x01, 0x01}), s);
+    TEST_ASSERT_EQ(s.volume_max, 30, "Captured playback capability: 31 steps, 0..30");
+    parseInboundPayload(V({0xa9, 0x01, 0x20, 0x11}), s);
+    TEST_ASSERT_EQ(s.volume, 17, "Captured volume notification: 17");
+
+    parseInboundPayload(V({0xd7, 0xd1, 0x02, 0x01}), s);
+    TEST_ASSERT(s.nc_button == "google-assistant", "Captured NC button: list index 1");
+    parseInboundPayload(V({0xd9, 0xd2, 0x01, 0x00}), s);
+    TEST_ASSERT(!s.touch_panel, "Captured touch panel notification: off");
+
+    // --- The two tables must stay apart ---------------------------------------------
+    // 0x47 is VPT_RET_PARAM in table 1 and VOICE_GUIDANCE_RET_PARAM in table 2.
+    HeadphoneState split;
+    parseInboundPayload(V({0x47, 0x01, 0x04}), split);
+    TEST_ASSERT(split.surround == "club", "Table-1 0x47 is a surround reply");
+    TEST_ASSERT(parseInboundPayloadT2(V({0x47, 0x01, 0x01, 0x00}), split), "Table-2 0x47 is a voice guidance reply");
+    TEST_ASSERT(!split.voice_guidance, "Captured voice guidance: off");
+    TEST_ASSERT(split.surround == "club", "A table-2 frame must not touch table-1 state");
+    parseInboundPayloadT2(V({0x47, 0x01, 0x02, 0x01}), split);
+    TEST_ASSERT(split.voice_guidance_language == "English", "Captured voice guidance language: English");
+
+    // --- IPC surface ------------------------------------------------------------------
+    IpcServer server;
+    TEST_ASSERT_EQ(server.handleCommandLine("optimizer start"), "OK\n", "optimizer start");
+    TEST_ASSERT(server.handleCommandLine("optimizer maybe").rfind("ERR", 0) == 0, "optimizer rejects nonsense");
+    TEST_ASSERT_EQ(server.handleCommandLine("volume 17"), "OK\n", "volume 17");
+    TEST_ASSERT(server.handleCommandLine("volume 31").rfind("ERR volume out of range", 0) == 0, "volume above max");
+    TEST_ASSERT(server.handleCommandLine("volume -1").rfind("ERR volume out of range", 0) == 0, "negative volume");
+    TEST_ASSERT_EQ(server.handleCommandLine("playback next"), "OK\n", "playback next");
+    TEST_ASSERT(server.handleCommandLine("playback rewind").rfind("ERR", 0) == 0, "playback rejects nonsense");
+    TEST_ASSERT_EQ(server.handleCommandLine("nc-button alexa"), "OK\n", "nc-button alexa");
+    TEST_ASSERT(server.handleCommandLine("nc-button siri").rfind("ERR", 0) == 0, "nc-button rejects nonsense");
+    TEST_ASSERT_EQ(server.handleCommandLine("touch-panel off"), "OK\n", "touch-panel off");
+    TEST_ASSERT_EQ(server.handleCommandLine("voice-guidance on"), "OK\n", "voice-guidance on");
+    TEST_ASSERT_EQ(server.handleCommandLine("eq user1"), "OK\n", "eq user1 selects the slot");
+    TEST_ASSERT_EQ(server.handleCommandLine("eq custom"), "OK\n", "eq custom selects Manual (used to be rejected)");
+    TEST_ASSERT_EQ(server.handleCommandLine("eq user2 1 2 3 4 5 6"), "OK\n", "eq user2 with bands");
+    TEST_ASSERT(server.handleCommandLine("eq user2 1 2 3").rfind("ERR custom eq requires", 0) == 0, "partial bands rejected");
+    TEST_ASSERT_EQ(server.handleCommandLine("raw2 46 01 01"), "OK\n", "raw2 accepted");
+
+    TEST_PASS("DeviceFeatures");
 }
 
 // ---------------------------------------------------------------------------
@@ -1149,6 +1274,7 @@ int main() {
     testStateEngine();
     testIpcServer();
     testCommandQueue();
+    testDeviceFeatures();
 
     std::cout << "========================================\n";
     std::cout << "Summary: " << (gTotalTests - gFailedTests) << "/" << gTotalTests

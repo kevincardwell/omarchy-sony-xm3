@@ -34,5 +34,15 @@
   "connection_mode": "quality",
   "codec": "LDAC",
   "last_updated": 1757462400,
-  "dsee_hx_active": false
+  "dsee_hx_active": false,
+  "firmware_version": "4.5.2",
+  "model_name": "WH-1000XM3",
+  "optimizer_state": "idle",
+  "optimizer_pressure": "1.0",
+  "volume": 17,
+  "volume_max": 30,
+  "nc_button": "ambient",
+  "touch_panel": true,
+  "voice_guidance": true,
+  "voice_guidance_language": "English"
 }

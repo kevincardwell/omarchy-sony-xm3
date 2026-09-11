@@ -40,7 +40,9 @@ def step_to_noise_mode(step):
 
 
 VALID_MODES = ["anc", "ambient", "wind", "off"]
-VALID_PRESETS = ["off", "bright", "excited", "mellow", "relaxed", "vocal", "treble", "bass", "speech", "custom"]
+VALID_PRESETS = ["off", "bright", "excited", "mellow", "relaxed", "vocal", "treble", "bass", "speech",
+                 "custom", "manual", "user1", "user2"]
+CUSTOM_SLOTS = ["custom", "manual", "user1", "user2"]
 
 class MockDaemon:
     def __init__(self, state_dir=None, runtime_dir=None):
@@ -76,6 +78,16 @@ class MockDaemon:
             "sound_position": "off",
             "auto_power_off": "180min",
             "connection_mode": "stable",
+            "firmware_version": "4.5.2",
+            "model_name": "WH-1000XM3",
+            "optimizer_state": "idle",
+            "optimizer_pressure": "1.0",
+            "volume": 17,
+            "volume_max": 30,
+            "nc_button": "ambient",
+            "touch_panel": True,
+            "voice_guidance": True,
+            "voice_guidance_language": "English",
             "codec": "LDAC",
             "dsee_hx_active": False,
             "last_updated": int(time.time())
@@ -173,7 +185,8 @@ class MockDaemon:
             if blocked:
                 return blocked
             preset = parts[1].lower()
-            if preset == "custom":
+            # A slot name alone selects it; with six numbers it also sets bands.
+            if preset in CUSTOM_SLOTS and len(parts) > 2:
                 if len(parts) < 8:
                     return "ERR custom eq requires 5 bands and clear bass (6 integers [-10, 10])\n"
                 try:
@@ -184,7 +197,7 @@ class MockDaemon:
                             return "ERR custom eq band out of range [-10, 10]\n"
                     if not (-10 <= cb <= 10):
                         return "ERR clear bass out of range [-10, 10]\n"
-                    self.state["eq_preset"] = "custom"
+                    self.state["eq_preset"] = "custom" if preset == "manual" else preset
                     self.state["eq_custom_bands"] = bands
                     self.state["clear_bass"] = cb
                     self.write_status()
@@ -194,7 +207,7 @@ class MockDaemon:
             else:
                 if preset not in VALID_PRESETS:
                     return f"ERR unknown eq preset \x27{preset}\x27\n"
-                self.state["eq_preset"] = preset
+                self.state["eq_preset"] = "custom" if preset == "manual" else preset
                 self.write_status()
                 return "OK\n"
 
@@ -212,6 +225,42 @@ class MockDaemon:
             self.write_status()
             return "OK\n"
 
+        if verb == "optimizer":
+            if len(parts) < 2 or parts[1].lower() not in ("start", "cancel"):
+                return "ERR expected start|cancel\n"
+            # The real headset reports progress over a dozen seconds; the mock
+            # jumps straight to the end so tests stay fast.
+            self.state["optimizer_state"] = "done" if parts[1].lower() == "start" else "idle"
+            self.write_status()
+            return "OK\n"
+
+        if verb == "volume":
+            max_volume = self.state["volume_max"]
+            try:
+                level = int(parts[1]) if len(parts) >= 2 else None
+            except ValueError:
+                level = None
+            if level is None:
+                return f"ERR expected a volume 0-{max_volume}\n"
+            if not (0 <= level <= max_volume):
+                return f"ERR volume out of range [0-{max_volume}]\n"
+            self.state["volume"] = level
+            self.write_status()
+            return "OK\n"
+
+        if verb == "playback":
+            if len(parts) < 2 or parts[1].lower() not in ("play", "pause", "next", "previous"):
+                return "ERR expected play|pause|next|previous\n"
+            return "OK\n"
+
+        if verb in ("touch-panel", "voice-guidance"):
+            if len(parts) < 2 or parts[1].lower() not in ("on", "off"):
+                return "ERR expected on|off\n"
+            field = "touch_panel" if verb == "touch-panel" else "voice_guidance"
+            self.state[field] = parts[1].lower() == "on"
+            self.write_status()
+            return "OK\n"
+
         # Enum-valued XM3 settings. Each rejects anything outside its vocabulary
         # so the integration suite can assert on the failure path too.
         ENUM_VERBS = {
@@ -221,6 +270,7 @@ class MockDaemon:
             "auto-power-off": ("auto_power_off",
                                ["off", "5min", "30min", "60min", "180min"]),
             "connection": ("connection_mode", ["quality", "stable"]),
+            "nc-button": ("nc_button", ["ambient", "google-assistant", "alexa"]),
         }
         if verb in ENUM_VERBS:
             field, allowed = ENUM_VERBS[verb]

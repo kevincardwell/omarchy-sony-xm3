@@ -266,6 +266,36 @@ else
   fail_test "T1.D9e" "ear-detect should be an unknown command" "exit=$c_ear"
 fi
 
+# T1.D9f: Device settings probed from the headset (volume, button, touch, voice)
+run_cli volume 12 >/dev/null 2>&1 || true
+run_cli nc-button alexa >/dev/null 2>&1 || true
+run_cli touch-panel off >/dev/null 2>&1 || true
+run_cli voice-guidance off >/dev/null 2>&1 || true
+if jq -e '.volume == 12 and .nc_button == "alexa" and .touch_panel == false and .voice_guidance == false' "$STATUS_FILE" >/dev/null 2>&1; then
+  pass_test "T1.D9f" "Volume, NC button, touch panel and voice guidance update via IPC"
+else
+  fail_test "T1.D9f" "Device settings were not updated properly" "$(cat "$STATUS_FILE")"
+fi
+run_cli nc-button ambient >/dev/null 2>&1 || true
+run_cli touch-panel on >/dev/null 2>&1 || true
+run_cli voice-guidance on >/dev/null 2>&1 || true
+
+# T1.D9g: Custom EQ slots, the optimizer and playback are accepted; nonsense is not
+run_cli eq user1 3 2 1 0 -1 4 >/dev/null 2>&1 || true
+s_eq=$(jq -r '.eq_preset + ":" + (.clear_bass|tostring)' "$STATUS_FILE")
+set +e
+run_cli eq custom >/dev/null 2>&1;         c_manual=$?
+run_cli optimizer start >/dev/null 2>&1;   c_opt=$?
+run_cli playback next >/dev/null 2>&1;     c_next=$?
+run_cli volume 31 >/dev/null 2>&1;         c_vol=$?
+run_cli nc-button siri >/dev/null 2>&1;    c_btn=$?
+set -e
+if [[ "$s_eq" == "user1:4" && $c_manual -eq 0 && $c_opt -eq 0 && $c_next -eq 0 && $c_vol -eq 1 && $c_btn -eq 1 ]]; then
+  pass_test "T1.D9g" "EQ slots, optimizer and playback accepted; out-of-range volume and unknown button rejected"
+else
+  fail_test "T1.D9g" "Device command checks failed" "eq=$s_eq manual=$c_manual opt=$c_opt next=$c_next vol=$c_vol btn=$c_btn"
+fi
+
 # T1.D9c: Unknown enum values are rejected rather than silently stored
 set +e
 run_cli surround stadium >/dev/null 2>&1;      c_surround=$?

@@ -38,14 +38,25 @@ var SOUND_POSITION_OFF = "off";
 var MAX_ERROR_CHARS = 140;
 var ELIDED_ERROR_CHARS = 137;
 
+var EQ_USER1 = "user1";
+var EQ_USER2 = "user2";
+
 var NOISE_MODES = [NOISE_ANC, NOISE_WIND, NOISE_AMBIENT, NOISE_OFF];
+// The XM3's full preset list, in the order its EQ capability reports them.
 var EQ_PRESETS = [
-  EQ_OFF, EQ_BRIGHT, EQ_EXCITED, EQ_MELLOW, EQ_RELAXED,
-  EQ_VOCAL, EQ_TREBLE, EQ_BASS, EQ_SPEECH, EQ_CUSTOM
+  EQ_OFF, EQ_BRIGHT, EQ_EXCITED, EQ_MELLOW, EQ_RELAXED, EQ_VOCAL,
+  EQ_TREBLE, EQ_BASS, EQ_SPEECH, EQ_CUSTOM, EQ_USER1, EQ_USER2
 ];
+// Presets whose five bands and Clear Bass the user sets.
+var EQ_CUSTOM_SLOTS = [EQ_CUSTOM, EQ_USER1, EQ_USER2];
+var EQ_BAND_LABELS = ["400", "1k", "2.5k", "6.3k", "16k"];
+var NC_BUTTONS = ["ambient", "google-assistant", "alexa"];
+var PLAYBACK_ACTIONS = ["previous", "play", "pause", "next"];
+var OPTIMIZER_RUNNING_STATES = ["measuring-fit", "measuring-pressure", "optimizing"];
 var SURROUND_PRESETS = ["off", "outdoor", "arena", "concert", "club"];
 var SOUND_POSITIONS = ["off", "front-left", "front-right", "front", "rear-left", "rear-right"];
-var AUTO_POWER_OFF_VALUES = ["off", "5min", "30min", "60min", "180min"];
+// Display order; the XM3's capability reports exactly these five.
+var AUTO_POWER_OFF_VALUES = ["5min", "30min", "60min", "180min", "off"];
 var CONNECTION_MODES = ["quality", "stable"];
 
 function defaultStatus() {
@@ -71,7 +82,16 @@ function defaultStatus() {
     soundPosition: SOUND_POSITION_OFF,
     autoPowerOff: "unknown",
     connectionMode: "unknown",
-    codec: ""
+    codec: "",
+    firmwareVersion: "",
+    optimizerState: "idle",
+    optimizerPressure: "",
+    volume: LEVEL_UNKNOWN,
+    volumeMax: 30,
+    ncButton: "unknown",
+    touchPanel: true,
+    voiceGuidance: true,
+    voiceGuidanceLanguage: ""
   };
 }
 
@@ -159,7 +179,7 @@ function parseStatus(raw) {
   res.ambientSoundLevel = clamp(rawAmbient, 0, res.ambientMaxLevel, 0);
   res.voicePassthrough = parsed.voice_passthrough === true;
 
-  res.eqPreset = oneOf(EQ_PRESETS.concat(["user1", "user2"]), parsed.eq_preset, EQ_OFF);
+  res.eqPreset = oneOf(EQ_PRESETS, parsed.eq_preset, EQ_OFF);
 
   var rawBands = Array.isArray(parsed.eq_custom_bands) ? parsed.eq_custom_bands : (Array.isArray(parsed.eq_bands) ? parsed.eq_bands : []);
   var bands = [];
@@ -176,6 +196,20 @@ function parseStatus(raw) {
   res.autoPowerOff = oneOf(AUTO_POWER_OFF_VALUES, parsed.auto_power_off, "unknown");
   res.connectionMode = oneOf(CONNECTION_MODES, parsed.connection_mode, "unknown");
   res.codec = String(parsed.codec || "");
+  res.firmwareVersion = String(parsed.firmware_version || "");
+
+  res.optimizerState = oneOf(["idle", "done"].concat(OPTIMIZER_RUNNING_STATES), parsed.optimizer_state, "idle");
+  res.optimizerPressure = String(parsed.optimizer_pressure || "");
+
+  res.volumeMax = clamp(parsed.volume_max, 1, 100, 30);
+  if (parsed.volume !== undefined && parsed.volume !== null && Number(parsed.volume) >= 0) {
+    res.volume = clamp(parsed.volume, 0, res.volumeMax, 0);
+  }
+
+  res.ncButton = oneOf(NC_BUTTONS, parsed.nc_button, "unknown");
+  res.touchPanel = parsed.touch_panel !== false;
+  res.voiceGuidance = parsed.voice_guidance !== false;
+  res.voiceGuidanceLanguage = String(parsed.voice_guidance_language || "");
 
   return res;
 }
@@ -205,6 +239,66 @@ function dseeDescription(enabled, active, connectionMode) {
   return "On, idle while EQ or surround is active";
 }
 
+function isCustomEqSlot(preset) {
+  return EQ_CUSTOM_SLOTS.indexOf(preset) !== -1;
+}
+
+function isOptimizerRunning(state) {
+  return OPTIMIZER_RUNNING_STATES.indexOf(state) !== -1;
+}
+
+function optimizerDescription(state, pressure) {
+  switch (state) {
+    case "measuring-fit": return "Measuring how the headset fits…";
+    case "measuring-pressure": return "Measuring atmospheric pressure…";
+    case "optimizing": return "Optimizing noise cancelling…";
+    case "done": return pressure ? "Optimized · " + pressure + " atm" : "Optimized";
+    default:
+      return pressure
+        ? "Last run measured " + pressure + " atm. Wear the headset, then optimize."
+        : "Tunes noise cancelling to your fit. Wear the headset first.";
+  }
+}
+
+function ncButtonName(button) {
+  switch (button) {
+    case "ambient": return "Noise control";
+    case "google-assistant": return "Google Assistant";
+    case "alexa": return "Alexa";
+    default: return "Unknown";
+  }
+}
+
+function ncButtonDescription(button) {
+  switch (button) {
+    case "ambient": return "The NC/AMBIENT button switches noise control.";
+    case "google-assistant": return "The NC/AMBIENT button talks to Google Assistant on your phone.";
+    case "alexa": return "The NC/AMBIENT button talks to Alexa on your phone.";
+    default: return "";
+  }
+}
+
+function autoPowerOffLabel(value) {
+  switch (value) {
+    case "5min": return "5 min";
+    case "30min": return "30 min";
+    case "60min": return "1 hr";
+    case "180min": return "3 hr";
+    case "off": return "Never";
+    default: return "—";
+  }
+}
+
+function voiceGuidanceDescription(enabled, language) {
+  if (!enabled) return "Spoken prompts are off";
+  return language ? "Spoken prompts in " + language : "Spoken prompts on connect, battery and mode changes";
+}
+
+function volumeFraction(volume, max) {
+  if (volume === undefined || volume === null || volume < 0 || !max) return 0.0;
+  return Math.max(0.0, Math.min(1.0, volume / max));
+}
+
 function stepToNoiseMode(step) {
   if (step === STEP_ANC) return NOISE_ANC;
   if (step === STEP_WIND) return NOISE_WIND;
@@ -226,6 +320,16 @@ function noiseModeName(mode) {
     case NOISE_AMBIENT: return "Ambient Sound";
     case NOISE_OFF: return "Off";
     default: return "Unknown";
+  }
+}
+
+function noiseModeButtonLabel(mode) {
+  switch (mode) {
+    case NOISE_ANC: return "ANC";
+    case NOISE_WIND: return "Wind";
+    case NOISE_AMBIENT: return "Ambient";
+    case NOISE_OFF: return "Off";
+    default: return "?";
   }
 }
 
@@ -253,8 +357,8 @@ function eqPresetName(preset) {
     case EQ_BASS: return "Bass Boost";
     case EQ_SPEECH: return "Speech";
     case EQ_CUSTOM: return "Manual";
-    case "user1": return "Custom 1";
-    case "user2": return "Custom 2";
+    case EQ_USER1: return "Custom 1";
+    case EQ_USER2: return "Custom 2";
     default: return "Unknown";
   }
 }
