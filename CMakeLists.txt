@@ -42,6 +42,9 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/cli/CMakeLists.txt")
     add_subdirectory(cli)
 endif()
 
+# No-follow file placement helper used by setup (not installed)
+add_subdirectory(installer)
+
 # Stress / boundary harnesses
 if(BUILD_TESTING AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/CMakeLists.txt")
     add_subdirectory(tests)

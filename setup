@@ -1,11 +1,85 @@
-#!/usr/bin/env bash
+#!/bin/bash -p
 # ==============================================================================
 # setup — Packaging, Build & Installation Script for omarchy-sony-xm3
 # Project: omarchy-sony-xm3 (Sony WH-1000XM3 Plugin & Headless Bluetooth Daemon)
 # ==============================================================================
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# ------------------------------------------------------------------------------
+# Trusted environment
+#
+# Nothing inherited from the caller decides which program runs. Unless the
+# environment already holds nothing but the variables below, the script
+# re-executes itself with an empty environment, a fixed system PATH and that
+# short allow-list of session variables (the ones systemctl --user and the
+# Omarchy shell need to reach this login session). Bash runs with -p, so it
+# ignores BASH_ENV and exported shell functions, and every tool below is called
+# by its absolute path. Inherited PATH entries, LD_PRELOAD, CC/CXX and CMAKE_*
+# variables therefore never reach the build or the installer.
+# ------------------------------------------------------------------------------
+readonly TRUSTED_PATH="/usr/bin:/usr/sbin:/bin:/sbin"
+readonly SESSION_VARS=(TERM COLORTERM LANG LC_ALL XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS
+                       WAYLAND_DISPLAY HYPRLAND_INSTANCE_SIGNATURE XDG_STATE_HOME)
+
+environment_is_trusted() {
+  [[ "${PATH:-}" == "$TRUSTED_PATH" ]] || return 1
+  local name known allowed
+  for name in $(compgen -e); do
+    case "$name" in
+      PATH|PWD|OLDPWD|SHLVL|_) continue ;;
+    esac
+    allowed=0
+    for known in "${SESSION_VARS[@]}"; do
+      [[ "$name" == "$known" ]] && allowed=1
+    done
+    (( allowed )) || return 1
+  done
+  return 0
+}
+
+if ! environment_is_trusted; then
+  keep=()
+  for name in "${SESSION_VARS[@]}"; do
+    if [[ -n "${!name:-}" ]]; then
+      keep+=("$name=${!name}")
+    fi
+  done
+  exec /usr/bin/env -i PATH="$TRUSTED_PATH" "${keep[@]}" /bin/bash -p "${BASH_SOURCE[0]}" "$@"
+fi
+
+# The home directory comes from the password database, not the environment.
+IFS=: read -r _ _ _ _ _ HOME _ < <(/usr/bin/getent passwd "$UID")
+[[ "$HOME" == /* ]] || { echo "Cannot determine your home directory." >&2; exit 1; }
+export HOME
+# The Omarchy CLI reads its install location from here; pin the packaged one.
+export OMARCHY_PATH="/usr/share/omarchy"
+
+# Fixed executable paths. None of these is looked up through PATH.
+readonly SUDO=/usr/bin/sudo
+readonly PACMAN=/usr/bin/pacman
+readonly OMARCHY=/usr/bin/omarchy
+readonly OMARCHY_SHELL=/usr/bin/omarchy-shell
+readonly SYSTEMCTL=/usr/bin/systemctl
+readonly CMAKE=/usr/bin/cmake
+readonly NINJA=/usr/bin/ninja
+readonly PKG_CONFIG=/usr/bin/pkg-config
+readonly BLUETOOTHCTL=/usr/bin/bluetoothctl
+readonly TIMEOUT=/usr/bin/timeout
+readonly SLEEP=/usr/bin/sleep
+readonly STAT=/usr/bin/stat
+
+script_path="${BASH_SOURCE[0]}"
+[[ "$script_path" == */* ]] || script_path="./$script_path"
+ROOT_DIR="$(cd "${script_path%/*}" && pwd -P)"
+readonly ROOT_DIR
+# Separate from any developer build tree, so no cached compiler or generator
+# from another configuration is reused.
+readonly BUILD_DIR="$ROOT_DIR/build-setup"
+readonly DEPLOY="$BUILD_DIR/installer/sony-xm3-deploy"
+
+readonly PLUGIN_ID="io.github.kevincardwell.omasonyxm3"
+readonly PLUGIN_DIR_REL=".config/omarchy/plugins/$PLUGIN_ID"
+readonly PLUGIN_FILES=(manifest.json Panel.qml Service.qml Model.js SonyIcon.qml)
 
 # Colors for terminal output
 BOLD='\033[1m'
@@ -32,7 +106,7 @@ error() {
 }
 
 print_help() {
-  cat << 'HELP_EOF'
+  /usr/bin/cat << 'HELP_EOF'
 Usage: setup [OPTIONS]
 
 Set up omarchy-sony-xm3: verify/install build dependencies, compile binaries,
@@ -45,19 +119,24 @@ Options:
 
 Steps performed:
   1. Detect Arch Linux (ID_LIKE=arch or /etc/arch-release) and check for
-     required packages: bluez-libs (or bluez), dbus, cmake, ninja, gcc/clang.
+     required packages: bluez-libs (or bluez), dbus, cmake, ninja, gcc, pkgconf.
      Install missing packages via omarchy pkg add or sudo pacman -S.
   1b. Warn if this machine has no Bluetooth adapter, if bluetooth.service is
      stopped, or if no WH-1000XM3 is paired. These are warnings, not errors.
-  2. Configure and build daemon and CLI using CMake and Ninja:
-     cmake -B build -G Ninja && cmake --build build
+  2. Configure and build daemon, CLI and installer helper with CMake and Ninja
+     in build-setup/.
   3. Install sony-xm3-daemon and sony-xm3-ctl into ~/.local/bin (mode 0755).
-  4. Copy daemon/sony-xm3.service to ~/.config/systemd/user/, then enable
+  4. Install daemon/sony-xm3.service into ~/.config/systemd/user/, then enable
      and (re)start it.
   5. Deploy the plugin to ~/.config/omarchy/plugins/io.github.kevincardwell.omasonyxm3,
      validate it, enable it next to the volume control, and restart the shell.
      If this checkout already is that directory (installed with
      `omarchy plugin add`), the files are used in place.
+
+The script runs with a scrubbed environment and a fixed PATH, calls every tool
+by absolute path, and writes into your home directory only through
+sony-xm3-deploy, which never follows a symbolic link and never deletes
+recursively.
 HELP_EOF
 }
 
@@ -81,12 +160,48 @@ for arg in "$@"; do
   esac
 done
 
+# A tool is trusted when it is a root-owned file that only root can modify.
+trusted_tool() {
+  local path="$1" owner mode
+  [[ -x "$path" ]] || return 1
+  read -r owner mode < <("$STAT" -L -c '%u %a' "$path") || return 1
+  [[ "$owner" == 0 ]] || return 1
+  (( (8#$mode & 8#022) == 0 ))
+}
+
+require_tool() {
+  local path="$1" hint="$2"
+  if ! trusted_tool "$path"; then
+    error "$path is missing or not a root-owned system file. $hint"
+    exit 1
+  fi
+}
+
+# The first of the given compilers that is a trusted system file.
+first_trusted() {
+  local candidate
+  for candidate in "$@"; do
+    if trusted_tool "$candidate"; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+have_omarchy() {
+  trusted_tool "$OMARCHY"
+}
+
 is_arch_linux() {
   if [[ -f /etc/arch-release ]]; then
     return 0
   fi
-  if [[ -f /etc/os-release ]] && grep -qE '^ID(_LIKE)?=.*arch' /etc/os-release; then
-    return 0
+  if [[ -f /etc/os-release ]]; then
+    local line
+    while IFS= read -r line; do
+      [[ "$line" =~ ^ID(_LIKE)?=.*arch ]] && return 0
+    done < /etc/os-release
   fi
   return 1
 }
@@ -97,137 +212,127 @@ check_and_install_dependencies() {
     info "Non-Arch distribution detected; skipping pacman dependency checks."
     return 0
   fi
+  require_tool "$PACMAN" "Is this an Arch-based system?"
 
   local missing_pkgs=()
-
-  # Check bluez-libs or bluez
-  if ! pacman -Q bluez-libs >/dev/null 2>&1 && ! pacman -Q bluez >/dev/null 2>&1; then
+  if ! "$PACMAN" -Q bluez-libs >/dev/null 2>&1 && ! "$PACMAN" -Q bluez >/dev/null 2>&1; then
     missing_pkgs+=("bluez-libs")
   fi
-
-  # Check dbus
-  if ! pacman -Q dbus >/dev/null 2>&1; then
-    missing_pkgs+=("dbus")
-  fi
-
-  # Check cmake (check pacman or command in PATH)
-  if ! pacman -Q cmake >/dev/null 2>&1 && ! command -v cmake >/dev/null 2>&1; then
-    missing_pkgs+=("cmake")
-  fi
-
-  # Check ninja (check pacman or command in PATH)
-  if ! pacman -Q ninja >/dev/null 2>&1 && ! command -v ninja >/dev/null 2>&1; then
-    missing_pkgs+=("ninja")
-  fi
-
-  # Check gcc or clang (check pacman or command in PATH)
-  if ! pacman -Q gcc >/dev/null 2>&1 && ! pacman -Q clang >/dev/null 2>&1 && \
-     ! command -v gcc >/dev/null 2>&1 && ! command -v clang >/dev/null 2>&1; then
-    missing_pkgs+=("gcc")
-  fi
-
-  if [[ ${#missing_pkgs[@]} -gt 0 ]]; then
-    info "Missing dependencies detected: ${missing_pkgs[*]}"
-    if command -v omarchy >/dev/null 2>&1; then
-      info "Installing dependencies via: omarchy pkg add ${missing_pkgs[*]}"
-      omarchy pkg add "${missing_pkgs[@]}"
-    elif command -v pacman >/dev/null 2>&1; then
-      info "Installing dependencies via: sudo pacman -S --needed --noconfirm ${missing_pkgs[*]}"
-      sudo pacman -S --needed --noconfirm "${missing_pkgs[@]}"
-    else
-      error "Cannot install missing packages: neither omarchy nor pacman is available."
-      exit 1
+  local pkg
+  for pkg in dbus cmake ninja gcc pkgconf; do
+    if ! "$PACMAN" -Q "$pkg" >/dev/null 2>&1; then
+      missing_pkgs+=("$pkg")
     fi
-  else
+  done
+
+  if [[ ${#missing_pkgs[@]} -eq 0 ]]; then
     success "All build dependencies are satisfied."
+    return 0
+  fi
+
+  info "Missing dependencies detected: ${missing_pkgs[*]}"
+  if have_omarchy; then
+    info "Installing dependencies via: omarchy pkg add ${missing_pkgs[*]}"
+    "$OMARCHY" pkg add "${missing_pkgs[@]}"
+  else
+    require_tool "$SUDO" "Install ${missing_pkgs[*]} with your package manager."
+    info "Installing dependencies via: sudo pacman -S --needed ${missing_pkgs[*]}"
+    "$SUDO" "$PACMAN" -S --needed "${missing_pkgs[@]}"
   fi
 }
 
 build_project() {
-  info "Configuring project with CMake and Ninja..."
-  cmake -B "$ROOT_DIR/build" -G Ninja
-  info "Building daemon and CLI targets..."
-  cmake --build "$ROOT_DIR/build"
+  require_tool "$CMAKE" "Install cmake with your package manager."
+  require_tool "$NINJA" "Install ninja with your package manager."
+  require_tool "$PKG_CONFIG" "Install pkgconf (pkg-config) with your package manager."
+  local cxx cc
+  cxx=$(first_trusted /usr/bin/g++ /usr/bin/clang++) \
+    || { error "No C++ compiler at /usr/bin/g++ or /usr/bin/clang++."; exit 1; }
+  cc=$(first_trusted /usr/bin/gcc /usr/bin/clang) \
+    || { error "No C compiler at /usr/bin/gcc or /usr/bin/clang."; exit 1; }
+
+  info "Configuring project with CMake and Ninja ($cxx)..."
+  "$CMAKE" -S "$ROOT_DIR" -B "$BUILD_DIR" -G Ninja \
+    -DCMAKE_MAKE_PROGRAM="$NINJA" \
+    -DCMAKE_CXX_COMPILER="$cxx" \
+    -DCMAKE_C_COMPILER="$cc" \
+    -DPKG_CONFIG_EXECUTABLE="$PKG_CONFIG" \
+    -DBUILD_TESTING=OFF
+  info "Building daemon, CLI and installer helper..."
+  "$CMAKE" --build "$BUILD_DIR" --target sony-xm3-daemon sony-xm3-ctl sony-xm3-deploy
   success "Build completed successfully."
+}
+
+# Uninstalling needs only the helper; build it if this checkout never has.
+ensure_deploy_helper() {
+  [[ -x "$DEPLOY" ]] && return 0
+  require_tool "$CMAKE" "Install cmake, or remove the files listed under Uninstall in the README by hand."
+  require_tool "$NINJA" "Install ninja, or remove the files listed under Uninstall in the README by hand."
+  local cxx
+  cxx=$(first_trusted /usr/bin/g++ /usr/bin/clang++) \
+    || { error "No C++ compiler at /usr/bin/g++ or /usr/bin/clang++."; exit 1; }
+  info "Building the installer helper..."
+  "$CMAKE" -S "$ROOT_DIR/installer" -B "$BUILD_DIR/installer" -G Ninja \
+    -DCMAKE_MAKE_PROGRAM="$NINJA" -DCMAKE_CXX_COMPILER="$cxx" -DBUILD_TESTING=OFF >/dev/null
+  "$CMAKE" --build "$BUILD_DIR/installer" --target sony-xm3-deploy >/dev/null
 }
 
 install_binaries() {
   info "Installing binaries into $HOME/.local/bin..."
-  mkdir -p "$HOME/.local/bin"
-
-  local daemon_bin="$ROOT_DIR/build/daemon/sony-xm3-daemon"
-  local ctl_bin="$ROOT_DIR/build/cli/sony-xm3-ctl"
-
-  if [[ ! -f "$daemon_bin" ]]; then
-    error "Daemon binary not found at $daemon_bin"
-    exit 1
-  fi
-  if [[ ! -f "$ctl_bin" ]]; then
-    error "CLI binary not found at $ctl_bin"
-    exit 1
-  fi
-
-  install -m 0755 "$daemon_bin" "$HOME/.local/bin/sony-xm3-daemon"
-  install -m 0755 "$ctl_bin" "$HOME/.local/bin/sony-xm3-ctl"
+  "$DEPLOY" put .local/bin 0755 \
+    "$BUILD_DIR/daemon/sony-xm3-daemon" \
+    "$BUILD_DIR/cli/sony-xm3-ctl"
   success "Binaries installed to $HOME/.local/bin/ (mode 0755)."
 }
 
 install_systemd_service() {
   info "Installing systemd user service..."
-  local service_src="$ROOT_DIR/daemon/sony-xm3.service"
-  local service_dir="$HOME/.config/systemd/user"
-  local service_dest="$service_dir/sony-xm3.service"
+  "$DEPLOY" put .config/systemd/user 0644 "$ROOT_DIR/daemon/sony-xm3.service"
 
-  if [[ ! -f "$service_src" ]]; then
-    error "Service unit not found at $service_src"
-    exit 1
-  fi
-
-  mkdir -p "$service_dir"
-  install -m 0644 "$service_src" "$service_dest"
-
-  systemctl --user daemon-reload 2>/dev/null || true
+  "$SYSTEMCTL" --user daemon-reload 2>/dev/null || true
   # enable --now starts it immediately; restart covers re-running setup over an
   # existing install, which would otherwise keep running the old binary.
-  systemctl --user enable --now sony-xm3.service 2>/dev/null || true
-  systemctl --user restart sony-xm3.service 2>/dev/null || true
+  "$SYSTEMCTL" --user enable --now sony-xm3.service 2>/dev/null || true
+  "$SYSTEMCTL" --user restart sony-xm3.service 2>/dev/null || true
   success "sony-xm3.service installed, enabled and running."
 }
 
-readonly PLUGIN_ID="io.github.kevincardwell.omasonyxm3"
-
 deploy_plugin() {
   info "Deploying Omarchy bar-widget plugin..."
-  # The only directory Omarchy scans for user plugins.
-  local plugin_dest="$HOME/.config/omarchy/plugins/$PLUGIN_ID"
+  local plugin_dest="$HOME/$PLUGIN_DIR_REL"
+  local sources=() file status=0
+  for file in "${PLUGIN_FILES[@]}"; do
+    sources+=("$ROOT_DIR/$file")
+  done
 
-  # `omarchy plugin add` clones the whole repository straight into the plugin
-  # directory. Running setup from there must not wipe its own checkout.
-  if [[ "$(realpath -m "$plugin_dest")" == "$(realpath "$ROOT_DIR")" ]]; then
-    info "Running from the installed plugin directory; using its files in place."
-  else
-    mkdir -p "$plugin_dest"
-    rm -rf "${plugin_dest:?}"/*
-    for file in manifest.json Panel.qml Service.qml Model.js SonyIcon.qml; do
-      cp "$ROOT_DIR/$file" "$plugin_dest/"
-    done
+  # Copies the plugin files by name, replacing only those files. When this
+  # checkout is the installed plugin (omarchy plugin add), nothing is copied;
+  # when the destination is some other git checkout, it is left for
+  # `omarchy plugin update` to manage.
+  "$DEPLOY" put --unless-git-checkout "$PLUGIN_DIR_REL" 0644 "${sources[@]}" || status=$?
+  if (( status == 3 )); then
+    warn "The installed plugin is a git checkout; update it with: omarchy plugin update $PLUGIN_ID"
+  elif (( status != 0 )); then
+    exit "$status"
   fi
 
-  if command -v omarchy >/dev/null 2>&1; then
-    omarchy plugin validate "$plugin_dest"
+  if have_omarchy; then
+    "$OMARCHY" plugin validate "$plugin_dest"
     success "Plugin validated and deployed to $plugin_dest."
 
     # A plugin dropped into the directory is not known until the shell rescans.
-    omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true
-    sleep 1
+    if trusted_tool "$OMARCHY_SHELL"; then
+      "$OMARCHY_SHELL" shell rescanPlugins >/dev/null 2>&1 || true
+    fi
+    "$SLEEP" 1
     info "Enabling $PLUGIN_ID next to the volume control..."
-    omarchy plugin enable "$PLUGIN_ID" --after omarchy.audio 2>/dev/null \
-      || omarchy plugin enable "$PLUGIN_ID" --section right 2>/dev/null \
+    "$OMARCHY" plugin enable "$PLUGIN_ID" --after omarchy.audio 2>/dev/null \
+      || "$OMARCHY" plugin enable "$PLUGIN_ID" --section right 2>/dev/null \
       || warn "Could not enable the plugin automatically; run: omarchy plugin enable $PLUGIN_ID"
 
     # Hot reload does not reliably load new or changed QML; a restart does.
     info "Restarting the Omarchy shell to load the widget..."
-    omarchy restart shell >/dev/null 2>&1 || warn "Restart the shell yourself: omarchy restart shell"
+    "$OMARCHY" restart shell >/dev/null 2>&1 || warn "Restart the shell yourself: omarchy restart shell"
   else
     success "Plugin deployed to $plugin_dest (omarchy CLI not found; enable it manually)."
   fi
@@ -248,14 +353,17 @@ check_bluetooth_prerequisites() {
     return 0
   fi
 
-  if ! systemctl is-active --quiet bluetooth 2>/dev/null; then
+  if ! "$SYSTEMCTL" is-active --quiet bluetooth 2>/dev/null; then
     warn "bluetooth.service is not running. Start it with:"
     warn "  sudo systemctl enable --now bluetooth"
   fi
 
-  if command -v bluetoothctl >/dev/null 2>&1; then
-    local paired
-    paired=$(timeout 5 bluetoothctl devices Paired 2>/dev/null | grep -i "WH-1000XM3" || true)
+  if trusted_tool "$BLUETOOTHCTL"; then
+    local devices line paired=""
+    devices=$("$TIMEOUT" 5 "$BLUETOOTHCTL" devices Paired 2>/dev/null || true)
+    while IFS= read -r line; do
+      [[ "$line" == *WH-1000XM3* ]] && paired="$line"
+    done <<< "$devices"
     if [[ -z "$paired" ]]; then
       warn "No paired WH-1000XM3 found. Pair it with this machine before use:"
       warn "  bluetoothctl -- scan on   # then: pair <MAC>, trust <MAC>, connect <MAC>"
@@ -267,29 +375,38 @@ check_bluetooth_prerequisites() {
 
 uninstall() {
   info "Uninstalling omarchy-sony-xm3..."
+  ensure_deploy_helper
 
-  systemctl --user disable --now sony-xm3.service 2>/dev/null || true
-  rm -f "$HOME/.config/systemd/user/sony-xm3.service"
-  systemctl --user daemon-reload 2>/dev/null || true
+  "$SYSTEMCTL" --user disable --now sony-xm3.service 2>/dev/null || true
+  "$DEPLOY" remove .config/systemd/user sony-xm3.service
+  "$SYSTEMCTL" --user daemon-reload 2>/dev/null || true
   success "sony-xm3.service stopped and removed."
 
-  rm -f "$HOME/.local/bin/sony-xm3-daemon" "$HOME/.local/bin/sony-xm3-ctl"
+  "$DEPLOY" remove .local/bin sony-xm3-daemon sony-xm3-ctl
   success "Binaries removed from $HOME/.local/bin/."
 
-  rm -rf "${XDG_STATE_HOME:-$HOME/.local/state}/sony-xm3"
-  success "State directory removed."
-
-  local plugin_dest="$HOME/.config/omarchy/plugins/$PLUGIN_ID"
-  if [[ -e "$plugin_dest" ]]; then
-    if command -v omarchy >/dev/null 2>&1; then
-      # Disables the widget, then deletes a git checkout or backs up a copy.
-      omarchy plugin remove "$PLUGIN_ID" --yes \
-        || warn "Could not remove the plugin; run: omarchy plugin remove $PLUGIN_ID"
-    else
-      rm -rf "${plugin_dest:?}"
-    fi
-    success "Plugin removed from the bar and from $plugin_dest."
+  # The daemon keeps status.json (and short-lived status.json.tmp.<pid> files)
+  # in its state directory; only those are removed.
+  local state_dirs=(".local/state/sony-xm3") dir
+  if [[ -n "${XDG_STATE_HOME:-}" && "$XDG_STATE_HOME" == "$HOME"/* &&
+        "${XDG_STATE_HOME%/}" != "$HOME/.local/state" ]]; then
+    state_dirs+=("${XDG_STATE_HOME#"$HOME"/}/sony-xm3")
   fi
+  for dir in "${state_dirs[@]}"; do
+    "$DEPLOY" remove --rmdir "$dir" status.json 'status.json.tmp.*'
+  done
+  success "State removed."
+
+  # Last, because a marketplace install runs this script from inside the
+  # plugin directory. `omarchy plugin remove` disables the widget first, then
+  # unlinks a symlink, deletes a git checkout, or backs up a plain copy.
+  if have_omarchy; then
+    "$OMARCHY" plugin remove "$PLUGIN_ID" --yes 2>/dev/null \
+      || info "The plugin was not installed, or is already removed."
+  else
+    "$DEPLOY" remove --rmdir "$PLUGIN_DIR_REL" "${PLUGIN_FILES[@]}"
+  fi
+  success "Plugin removed."
 
   success "omarchy-sony-xm3 uninstalled. Your Bluetooth pairing is untouched."
 }
@@ -306,7 +423,6 @@ main() {
   install_binaries
   install_systemd_service
   deploy_plugin
-  chmod 755 "$ROOT_DIR/setup" 2>/dev/null || true
   success "omarchy-sony-xm3 setup completed successfully!"
 }
 

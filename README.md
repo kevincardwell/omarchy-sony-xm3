@@ -122,6 +122,7 @@ back to 19 until it answers.
 - **Plugin** (`Panel.qml`, `Service.qml`, `Model.js`, `SonyIcon.qml`) — Quickshell/QML, Omarchy manifest schema 1.
 - **`daemon/`** — C++20 daemon owning the RFCOMM link and the UNIX socket.
 - **`cli/`** — `sony-xm3-ctl`, a thin client for the same socket.
+- **`installer/`** — `sony-xm3-deploy`, the helper `setup` uses to place and remove files without following symlinks (built, never installed).
 
 ---
 
@@ -151,6 +152,20 @@ cd omarchy-sony-xm3
 prerequisites, builds with CMake + Ninja, installs `sony-xm3-daemon` and
 `sony-xm3-ctl` to `~/.local/bin/`, registers the `sony-xm3.service` user unit,
 and deploys the plugin to `~/.config/omarchy/plugins/`.
+
+**How setup protects itself.** Setup re-runs itself with an empty environment
+and a fixed system `PATH` (`/usr/bin:/usr/sbin:/bin:/sbin`). It keeps only the
+session variables that `systemctl --user` and the Omarchy shell need, and runs
+bash with `-p`, so `BASH_ENV` and exported shell functions are ignored. Every
+tool it runs (`sudo`, `pacman`, `omarchy`, `cmake`, `ninja`, the compiler,
+`systemctl`) is called by an absolute path and must be a root-owned file that
+only root can write. It builds in its own `build-setup/` directory with the
+compiler and generator pinned. Every file in your home directory is written or
+removed by `sony-xm3-deploy`. It opens each directory below your home with
+`O_NOFOLLOW`, keeps it open while it works, and refuses symlinks and
+directories other users own or can write to. It writes each file to a
+temporary name and renames it into place. It deletes only the files it is
+named, never a directory tree.
 
 **Installed from the Omarchy plugin marketplace** (or with `omarchy plugin
 add`)? That adds the bar widget only. The widget needs the daemon, so build and
@@ -260,6 +275,12 @@ cmake -B build -G Ninja && cmake --build build
 # C++ stress and boundary suites
 ./build/tests/stress_test_protocol
 ./build/tests/stress_test_boundary_transport
+
+# Installer helper: refuses symlinks, deletes only named files
+./tests/test_deploy.sh build/installer/sony-xm3-deploy
+
+# All of the above that CMake knows about
+ctest --test-dir build
 
 # Plugin model tests (Deno or Node)
 deno run --allow-read tests/model.test.js
