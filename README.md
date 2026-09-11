@@ -8,6 +8,21 @@ This is a port of [andROYdified/omarchy-sony](https://github.com/andROYdified/om
 same; the protocol layer and the feature set are not — see
 [Why this is a port, not a config change](#why-this-is-a-port-not-a-config-change).
 
+<p align="center">
+  <img src="docs/screenshots/bar.png" alt="The headphone widget in the Omarchy bar, showing 60% battery" height="36">
+</p>
+
+<table>
+  <tr>
+    <th>Sound</th>
+    <th>Device</th>
+  </tr>
+  <tr>
+    <td valign="top"><img src="docs/screenshots/sound.png" alt="Sound tab on LDAC: noise control, ambient level, Bluetooth priority and DSEE HX" width="400"></td>
+    <td valign="top"><img src="docs/screenshots/device.png" alt="Device tab: headset volume, playback, NC optimizer, NC/AMBIENT button, touch panel, voice guidance and auto power off" width="400"></td>
+  </tr>
+</table>
+
 ---
 
 ## Requirements
@@ -246,9 +261,13 @@ preference:
 | DSEE HX | idle (nothing to restore) | active |
 
 On "sound quality" the XM3 does not apply EQ or surround at all — sent anyway,
-it answers with a prompt to change connection mode instead. The panel greys
-those sections out and says why; the CLI refuses them with the same
-explanation.
+it answers with a prompt to change connection mode instead. The panel hides
+those sections and says why; the CLI refuses them with the same explanation.
+Switch to "stable" and they appear:
+
+<p align="center">
+  <img src="docs/screenshots/sound-stable.png" alt="Sound tab on a stable connection: equalizer with Custom 1 band sliders, surround and sound position" width="400">
+</p>
 
 **For the best sound, stay on "sound quality"** and, if you want EQ, do it on the
 PC with [EasyEffects](https://github.com/wwmm/easyeffects) — that applies before

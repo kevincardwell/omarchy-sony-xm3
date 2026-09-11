@@ -206,6 +206,7 @@ int main(int argc, char* argv[]) {
             s.voice_guidance_language = "English";
             s.optimizer_pressure = "1.0";
             s.firmware_version = "4.5.2";
+            s.codec = "SBC";
         });
         stateEngine.save();
     }
@@ -513,6 +514,10 @@ int main(int argc, char* argv[]) {
     };
     ipcCb.setConnectionMode = [&](ConnectionMode mode, std::string& /*err*/) {
         stateEngine.setConnectionMode(connectionModeToString(mode));
+        if (opts.mockMode) {
+            // A real headset renegotiates and announces the codec itself.
+            stateEngine.setCodec(mode == ConnectionMode::SOUND_QUALITY ? "LDAC" : "SBC");
+        }
         stateEngine.save();
         send(serializeConnectionMode(mode), "connection mode");
         send(serializeQueryEq(), "re-query eq after mode change");

@@ -399,7 +399,9 @@ Panel {
     open: root.opened
     focusTarget: keyCatcher
     contentWidth: panel.fittedContentWidth(Style.space(400))
-    contentHeight: panel.fittedContentHeight(panelColumn.implicitHeight + Style.space(24), Style.space(820))
+    // Tall enough for the longest view (Stable, custom EQ) without scrolling;
+    // fittedContentHeight still clamps it to smaller screens.
+    contentHeight: panel.fittedContentHeight(panelColumn.implicitHeight, Style.space(1120))
 
     PanelKeyCatcher {
       id: keyCatcher
