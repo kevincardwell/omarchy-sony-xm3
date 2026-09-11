@@ -1,4 +1,4 @@
-# omarchy-sony-xm3
+# Omarchy Sony XM3
 
 An Omarchy bar-widget plugin and headless C++20 daemon for managing **Sony
 WH-1000XM3** headphones on Linux.
