@@ -96,15 +96,11 @@ public:
     void setDsee(bool enabled);
     void updateDsee(bool enabled) { setDsee(enabled); }
 
-    // Pause playback when the headphones are taken off.
-    void setEarDetection(bool enabled);
-    void updateEarDetection(bool enabled) { setEarDetection(enabled); }
-
     // VPT surround preset: off | outdoor | arena | concert | club
     bool setSurround(const std::string& preset);
     // VPT sound position: off | front-left | front-right | front | rear-left | rear-right
     bool setSoundPosition(const std::string& position);
-    // Auto power off: off | 5min | 30min | 60min | 180min | on-remove
+    // Auto power off: off | 5min | 30min | 60min | 180min
     bool setAutoPowerOff(const std::string& timer);
     // Bluetooth link preference: quality | stable
     bool setConnectionMode(const std::string& mode);

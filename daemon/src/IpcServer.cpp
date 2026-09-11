@@ -602,8 +602,7 @@ std::string IpcServer::handleBuiltinCommand(const std::string& line) {
     }
 
     // 5. Boolean feature toggles
-    if (verb == "voice-focus" || verb == "dsee" ||
-        verb == "ear-detect" || verb == "ear-detection") {
+    if (verb == "voice-focus" || verb == "dsee") {
         if (tokens.size() < 2) {
             return "ERR expected on|off\n";
         }
@@ -618,13 +617,9 @@ std::string IpcServer::handleBuiltinCommand(const std::string& line) {
             if (callbacks_.setVoiceFocus && !callbacks_.setVoiceFocus(enabled, err)) {
                 return "ERR " + (err.empty() ? "failed to set focus on voice" : err) + "\n";
             }
-        } else if (verb == "dsee") {
+        } else {
             if (callbacks_.setDsee && !callbacks_.setDsee(enabled, err)) {
                 return "ERR " + (err.empty() ? "failed to set dsee" : err) + "\n";
-            }
-        } else {
-            if (callbacks_.setEarDetection && !callbacks_.setEarDetection(enabled, err)) {
-                return "ERR " + (err.empty() ? "failed to set ear detection" : err) + "\n";
             }
         }
         return "OK\n";
@@ -666,10 +661,10 @@ std::string IpcServer::handleBuiltinCommand(const std::string& line) {
         return "OK\n";
     }
 
-    // 8. auto-power-off <off|5min|30min|60min|180min|on-remove>
+    // 8. auto-power-off <off|5min|30min|60min|180min>
     if (verb == "auto-power-off") {
         if (tokens.size() < 2) {
-            return "ERR expected off|5min|30min|60min|180min|on-remove\n";
+            return "ERR expected off|5min|30min|60min|180min\n";
         }
         auto timer = protocol::stringToAutoPowerOff(toLower(tokens[1]));
         if (timer == protocol::AutoPowerOff::UNKNOWN) {

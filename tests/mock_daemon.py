@@ -6,7 +6,7 @@ Simulates sony-xm3-daemon:
 - Manages headphone state
 - Atomically writes state updates to $XDG_STATE_HOME/sony-xm3/status.json
 - Handles wire protocol commands:
-    status, noise, ambient-level, eq, voice-focus, dsee, ear-detect,
+    status, noise, ambient-level, eq, voice-focus, dsee,
     surround, sound-position, auto-power-off, connection
 - Signal handling:
     SIGTERM / SIGINT: clean shutdown (unlinks socket and status.json)
@@ -75,9 +75,9 @@ class MockDaemon:
             "surround": "off",
             "sound_position": "off",
             "auto_power_off": "180min",
-            "connection_mode": "quality",
+            "connection_mode": "stable",
             "codec": "LDAC",
-            "ear_detection": True,
+            "dsee_hx_active": False,
             "last_updated": int(time.time())
         }
 
@@ -98,6 +98,13 @@ class MockDaemon:
             os.fsync(f.fileno())
         os.chmod(tmp_file, 0o600)
         os.replace(tmp_file, self.status_file)
+
+    def dsp_blocked(self, feature):
+        """The XM3 cannot run EQ or VPT while streaming LDAC; mirror the daemon."""
+        if self.state.get("connection_mode") == "quality":
+            return (f"ERR {feature} is unavailable on Priority on sound quality (LDAC); "
+                    "use `sony-xm3-ctl connection stable` to trade LDAC for it\n")
+        return None
 
     def handle_command(self, cmd_line):
         line = cmd_line.strip()
@@ -162,6 +169,9 @@ class MockDaemon:
         if verb == "eq":
             if len(parts) < 2:
                 return "ERR missing eq preset\n"
+            blocked = self.dsp_blocked("EQ")
+            if blocked:
+                return blocked
             preset = parts[1].lower()
             if preset == "custom":
                 if len(parts) < 8:
@@ -209,24 +219,21 @@ class MockDaemon:
             "sound-position": ("sound_position",
                                ["off", "front-left", "front-right", "front", "rear-left", "rear-right"]),
             "auto-power-off": ("auto_power_off",
-                               ["off", "5min", "30min", "60min", "180min", "on-remove"]),
+                               ["off", "5min", "30min", "60min", "180min"]),
             "connection": ("connection_mode", ["quality", "stable"]),
         }
         if verb in ENUM_VERBS:
             field, allowed = ENUM_VERBS[verb]
+            if verb in ("surround", "sound-position"):
+                blocked = self.dsp_blocked("Surround" if verb == "surround" else "Sound position")
+                if blocked:
+                    return blocked
             if len(parts) < 2:
                 return "ERR expected " + "|".join(allowed) + "\n"
             value = parts[1].lower()
             if value not in allowed:
                 return f"ERR unknown {verb} value '{parts[1]}'\n"
             self.state[field] = value
-            self.write_status()
-            return "OK\n"
-
-        if verb == "ear-detect" or verb == "ear-detection":
-            if len(parts) < 2 or parts[1].lower() not in ["on", "off"]:
-                return "ERR expected on|off\n"
-            self.state["ear_detection"] = parts[1].lower() == "on"
             self.write_status()
             return "OK\n"
 

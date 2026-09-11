@@ -22,13 +22,14 @@ Panel {
   property int noiseIndex: 0
   property int eqIndex: 0
   property int surroundIndex: 0
+  property int connectionIndex: 0
   property bool cursorActive: false
 
   readonly property var noiseModes: Model.NOISE_MODES
 
   // Vertical order of the focusable sections, used by the j/k navigation.
   readonly property var sectionOrder: [
-    "noise", "ambient", "voiceFocus", "eq", "surround", "dsee", "earDetect"
+    "noise", "ambient", "voiceFocus", "connection", "eq", "surround", "dsee"
   ]
 
   implicitWidth: button.implicitWidth
@@ -49,6 +50,8 @@ Panel {
       eqIndex = eqIdx !== -1 ? eqIdx : 0
       var sIdx = Model.SURROUND_PRESETS.indexOf(sony.surround)
       surroundIndex = sIdx !== -1 ? sIdx : 0
+      var cIdx = Model.CONNECTION_MODES.indexOf(sony.connectionMode)
+      connectionIndex = cIdx !== -1 ? cIdx : 0
       if (panelFlick) panelFlick.contentY = 0
       sony.refresh()
       Qt.callLater(function() { keyCatcher.forceActiveFocus() })
@@ -59,6 +62,7 @@ Panel {
   function sectionEnabled(name) {
     if (name === "ambient") return sony.noiseMode === Model.NOISE_AMBIENT
     if (name === "voiceFocus") return sony.voiceFocusAvailable
+    if (name === "eq" || name === "surround") return sony.dspAvailable
     return true
   }
 
@@ -106,6 +110,8 @@ Panel {
         eqIndex = Math.max(0, Math.min(Model.EQ_PRESETS.length - 1, eqIndex + dx))
       } else if (focusSection === "surround") {
         surroundIndex = Math.max(0, Math.min(Model.SURROUND_PRESETS.length - 1, surroundIndex + dx))
+      } else if (focusSection === "connection") {
+        connectionIndex = Math.max(0, Math.min(Model.CONNECTION_MODES.length - 1, connectionIndex + dx))
       }
     }
   }
@@ -121,10 +127,10 @@ Panel {
       sony.setEqPreset(Model.EQ_PRESETS[eqIndex])
     } else if (focusSection === "surround") {
       sony.setSurround(Model.SURROUND_PRESETS[surroundIndex])
+    } else if (focusSection === "connection") {
+      sony.setConnectionMode(Model.CONNECTION_MODES[connectionIndex])
     } else if (focusSection === "dsee") {
       sony.setDsee(!sony.dseeHx)
-    } else if (focusSection === "earDetect") {
-      sony.setEarDetect(!sony.earDetection)
     }
   }
 
@@ -198,7 +204,7 @@ Panel {
     open: root.opened
     focusTarget: keyCatcher
     contentWidth: panel.fittedContentWidth(Style.space(380))
-    contentHeight: panel.fittedContentHeight(panelColumn.implicitHeight + Style.space(24), Style.space(620))
+    contentHeight: panel.fittedContentHeight(panelColumn.implicitHeight + Style.space(24), Style.space(820))
 
     PanelKeyCatcher {
       id: keyCatcher
@@ -227,11 +233,16 @@ Panel {
           // -------------------------------------------------------------------
           // 1. Device Header
           // -------------------------------------------------------------------
-          Row {
+          // An Item rather than a Row: the battery block is pinned to the right
+          // edge, and a Row refuses horizontal anchors on its children and then
+          // lays out nothing at all.
+          Item {
             width: parent.width
-            spacing: Style.space(12)
+            height: Math.max(headerIcon.height, headerText.implicitHeight, batteryBlock.implicitHeight)
 
             SonyIcon {
+              id: headerIcon
+              anchors.left: parent.left
               anchors.verticalCenter: parent.verticalCenter
               iconSize: Style.space(28)
               connected: sony.connected
@@ -240,8 +251,12 @@ Panel {
             }
 
             Column {
+              id: headerText
+              anchors.left: headerIcon.right
+              anchors.leftMargin: Style.space(12)
+              anchors.right: batteryBlock.left
+              anchors.rightMargin: Style.space(12)
               anchors.verticalCenter: parent.verticalCenter
-              width: parent.width - Style.space(110)
               spacing: Style.space(2)
 
               Text {
@@ -282,6 +297,7 @@ Panel {
 
             // Battery status block
             Column {
+              id: batteryBlock
               anchors.verticalCenter: parent.verticalCenter
               anchors.right: parent.right
               spacing: Style.space(2)
@@ -454,14 +470,84 @@ Panel {
           }
 
           // -------------------------------------------------------------------
-          // 4. Equalizer Presets Selector
+          // 4. Bluetooth connection priority
+          //
+          // The XM3's own trade-off: LDAC, or its EQ and surround processing.
+          // It cannot do both, so this control decides whether the two
+          // sections below are usable.
           // -------------------------------------------------------------------
           Column {
             width: parent.width
             spacing: Style.space(8)
 
             PanelSectionHeader {
-              text: "EQUALIZER PRESET (" + Model.eqPresetName(sony.eqPreset) + ")"
+              text: "BLUETOOTH PRIORITY"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+            }
+
+            Row {
+              id: connectionRow
+              width: parent.width
+              spacing: Style.space(6)
+
+              readonly property real cellWidth: (width - spacing) / 2
+
+              Repeater {
+                model: [
+                  { mode: "quality", label: "Sound quality" },
+                  { mode: "stable", label: "Stable" }
+                ]
+
+                Button {
+                  required property var modelData
+                  required property int index
+                  width: connectionRow.cellWidth
+                  text: modelData.label
+                  fontSize: Style.font.bodySmall
+                  foreground: root.foreground
+                  fontFamily: root.fontFamily
+                  bordered: true
+                  selected: sony.connectionMode === modelData.mode
+                  hasCursor: root.cursorActive && root.focusSection === "connection" && root.connectionIndex === index
+                  onClicked: {
+                    root.focusSection = "connection"
+                    root.connectionIndex = index
+                    sony.setConnectionMode(modelData.mode)
+                  }
+                }
+              }
+            }
+
+            Text {
+              width: parent.width
+              textFormat: Text.PlainText
+              wrapMode: Text.WordWrap
+              text: sony.dspAvailable
+                ? "EQ and surround available. Audio uses a lower-quality codec."
+                : "LDAC for the best sound. EQ and surround are off while this is on."
+              color: Qt.darker(root.foreground, 1.4)
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+          }
+
+          PanelSeparator {
+            foreground: root.foreground
+          }
+
+          // -------------------------------------------------------------------
+          // 5. Equalizer Presets Selector
+          // -------------------------------------------------------------------
+          Column {
+            width: parent.width
+            spacing: Style.space(8)
+            opacity: sony.dspAvailable ? 1.0 : 0.4
+
+            PanelSectionHeader {
+              text: sony.dspAvailable
+                ? "EQUALIZER PRESET (" + Model.eqPresetName(sony.eqPreset) + ")"
+                : "EQUALIZER (NEEDS STABLE PRIORITY)"
               foreground: root.foreground
               fontFamily: root.fontFamily
             }
@@ -487,6 +573,7 @@ Panel {
                   fontFamily: root.fontFamily
                   bordered: true
                   selected: sony.eqPreset === modelData
+                  enabled: sony.dspAvailable
                   hasCursor: root.cursorActive && root.focusSection === "eq" && root.eqIndex === index
                   horizontalPadding: Style.space(4)
                   verticalPadding: Style.space(6)
@@ -505,14 +592,15 @@ Panel {
           }
 
           // -------------------------------------------------------------------
-          // 5. Surround (VPT)
+          // 6. Surround (VPT)
           // -------------------------------------------------------------------
           Column {
             width: parent.width
             spacing: Style.space(8)
+            opacity: sony.dspAvailable ? 1.0 : 0.4
 
             PanelSectionHeader {
-              text: "SURROUND (VPT)"
+              text: sony.dspAvailable ? "SURROUND (VPT)" : "SURROUND (NEEDS STABLE PRIORITY)"
               foreground: root.foreground
               fontFamily: root.fontFamily
             }
@@ -537,6 +625,7 @@ Panel {
                   fontFamily: root.fontFamily
                   bordered: true
                   selected: sony.surround === modelData
+                  enabled: sony.dspAvailable
                   hasCursor: root.cursorActive && root.focusSection === "surround" && root.surroundIndex === index
                   horizontalPadding: Style.space(4)
                   verticalPadding: Style.space(6)
@@ -555,7 +644,7 @@ Panel {
           }
 
           // -------------------------------------------------------------------
-          // 6. Feature Toggles
+          // 7. Feature Toggles
           // -------------------------------------------------------------------
           Column {
             width: parent.width
@@ -571,7 +660,7 @@ Panel {
               id: toggleDsee
               width: parent.width
               label: "DSEE HX"
-              description: "Restores high-range detail lost to compression"
+              description: Model.dseeDescription(sony.dseeHx, sony.dseeHxActive, sony.connectionMode)
               checked: sony.dseeHx
               hasCursor: root.cursorActive && root.focusSection === "dsee"
               foreground: root.foreground
@@ -579,21 +668,6 @@ Panel {
               onClicked: {
                 root.focusSection = "dsee"
                 sony.setDsee(!sony.dseeHx)
-              }
-            }
-
-            Toggle {
-              id: toggleEarDetect
-              width: parent.width
-              label: "Wearing Detection"
-              description: "Pauses playback when the headphones come off"
-              checked: sony.earDetection
-              hasCursor: root.cursorActive && root.focusSection === "earDetect"
-              foreground: root.foreground
-              fontFamily: root.fontFamily
-              onClicked: {
-                root.focusSection = "earDetect"
-                sony.setEarDetect(!sony.earDetection)
               }
             }
           }

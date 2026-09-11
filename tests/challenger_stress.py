@@ -239,7 +239,7 @@ def test_atomic_file_updates_under_load(sbox):
             "dsee on\n",
             "dsee off\n",
             "surround arena\n",
-            "ear-detect on\n",
+            "dsee on\n",
             "_set_battery 90 false\n",
             "_set_battery 20 true\n",
         ]

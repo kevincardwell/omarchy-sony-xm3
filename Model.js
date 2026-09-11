@@ -45,7 +45,7 @@ var EQ_PRESETS = [
 ];
 var SURROUND_PRESETS = ["off", "outdoor", "arena", "concert", "club"];
 var SOUND_POSITIONS = ["off", "front-left", "front-right", "front", "rear-left", "rear-right"];
-var AUTO_POWER_OFF_VALUES = ["off", "5min", "30min", "60min", "180min", "on-remove"];
+var AUTO_POWER_OFF_VALUES = ["off", "5min", "30min", "60min", "180min"];
 var CONNECTION_MODES = ["quality", "stable"];
 
 function defaultStatus() {
@@ -66,7 +66,7 @@ function defaultStatus() {
     eqCustomBands: [0, 0, 0, 0, 0],
     clearBass: 0,
     dseeHx: false,
-    earDetection: true,
+    dseeHxActive: false,
     surround: SURROUND_OFF,
     soundPosition: SOUND_POSITION_OFF,
     autoPowerOff: "unknown",
@@ -170,7 +170,7 @@ function parseStatus(raw) {
   res.clearBass = clamp(parsed.clear_bass, -10, 10, 0);
 
   res.dseeHx = parsed.dsee_hx === true || parsed.dsee === true;
-  res.earDetection = parsed.ear_detection !== undefined ? (parsed.ear_detection === true) : true;
+  res.dseeHxActive = parsed.dsee_hx_active === true;
   res.surround = oneOf(SURROUND_PRESETS, parsed.surround, SURROUND_OFF);
   res.soundPosition = oneOf(SOUND_POSITIONS, parsed.sound_position, SOUND_POSITION_OFF);
   res.autoPowerOff = oneOf(AUTO_POWER_OFF_VALUES, parsed.auto_power_off, "unknown");
@@ -183,6 +183,27 @@ function parseStatus(raw) {
 // ---------------------------------------------------------------------------
 // Step <-> mode mapping (mirrors the daemon's protocol helpers)
 // ---------------------------------------------------------------------------
+
+// On "Priority on sound quality" the XM3 streams LDAC and cannot run its EQ
+// or VPT (surround / sound position) processing at the same time.
+function dspAvailable(connectionMode) {
+  return connectionMode !== "quality";
+}
+
+function connectionModeName(mode) {
+  switch (mode) {
+    case "quality": return "Sound quality (LDAC)";
+    case "stable": return "Stable connection";
+    default: return "Unknown";
+  }
+}
+
+function dseeDescription(enabled, active, connectionMode) {
+  if (!enabled) return "Restores detail lost to compressed audio";
+  if (active) return "Upscaling compressed audio";
+  if (connectionMode === "quality") return "On, idle: LDAC has nothing to restore";
+  return "On, idle while EQ or surround is active";
+}
 
 function stepToNoiseMode(step) {
   if (step === STEP_ANC) return NOISE_ANC;
@@ -208,13 +229,15 @@ function noiseModeName(mode) {
   }
 }
 
+// Nerd Font Material Design glyphs, checked by rendering them in the bar font.
+// (The upstream codepoints were a zoom icon, a PDF file, a bag and a plus.)
 function noiseModeIcon(mode) {
   switch (mode) {
-    case NOISE_ANC: return "󰍋";
-    case NOISE_WIND: return "󰒚";
-    case NOISE_AMBIENT: return "󰈦";
-    case NOISE_OFF: return "󰍌";
-    default: return "󰍋";
+    case NOISE_ANC: return "\u{F0A45}";      // md-ear-hearing-off: outside sound blocked
+    case NOISE_WIND: return "\u{F059D}";     // md-weather-windy
+    case NOISE_AMBIENT: return "\u{F07C5}";  // md-ear-hearing: outside sound let in
+    case NOISE_OFF: return "\u{F015A}";      // md-close-circle-outline
+    default: return "\u{F0A45}";
   }
 }
 

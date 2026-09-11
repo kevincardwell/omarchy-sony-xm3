@@ -220,13 +220,12 @@ else
   fail_test "T1.D8" "Custom EQ bands were not updated properly" "$(cat "$STATUS_FILE")"
 fi
 
-# T1.D9: Socket IPC toggles (Focus on Voice, DSEE HX, Wearing Detection)
+# T1.D9: Socket IPC toggles (Focus on Voice, DSEE HX)
 run_cli noise ambient 12 >/dev/null 2>&1 || true
 run_cli voice-focus on >/dev/null 2>&1 || true
 run_cli dsee off >/dev/null 2>&1 || true
-run_cli ear-detect off >/dev/null 2>&1 || true
-if jq -e '.voice_passthrough == true and .dsee_hx == false and .ear_detection == false' "$STATUS_FILE" >/dev/null 2>&1; then
-  pass_test "T1.D9" "Daemon updates feature switches (Focus on Voice, DSEE HX, Wearing Detection)"
+if jq -e '.voice_passthrough == true and .dsee_hx == false' "$STATUS_FILE" >/dev/null 2>&1; then
+  pass_test "T1.D9" "Daemon updates feature switches (Focus on Voice, DSEE HX)"
 else
   fail_test "T1.D9" "Feature toggles were not updated properly" "$(cat "$STATUS_FILE")"
 fi
@@ -240,6 +239,31 @@ if jq -e '.surround == "concert" and .sound_position == "rear-left" and .auto_po
   pass_test "T1.D9b" "Daemon updates VPT, auto power off and connection mode via IPC"
 else
   fail_test "T1.D9b" "Enum settings were not updated properly" "$(cat "$STATUS_FILE")"
+fi
+
+# T1.D9d: On LDAC the XM3 cannot run EQ or VPT; the daemon refuses up front
+run_cli connection quality >/dev/null 2>&1 || true
+set +e
+run_cli eq bass >/dev/null 2>&1;              c_eq=$?
+run_cli surround arena >/dev/null 2>&1;       c_vpt=$?
+run_cli sound-position front >/dev/null 2>&1; c_pos=$?
+run_cli noise anc >/dev/null 2>&1;            c_nc=$?
+set -e
+run_cli connection stable >/dev/null 2>&1 || true
+if [[ $c_eq -eq 1 && $c_vpt -eq 1 && $c_pos -eq 1 && $c_nc -eq 0 ]]; then
+  pass_test "T1.D9d" "EQ and VPT refused on LDAC; noise control still allowed"
+else
+  fail_test "T1.D9d" "LDAC guard misbehaved" "eq=$c_eq surround=$c_vpt position=$c_pos noise=$c_nc"
+fi
+
+# T1.D9e: The XM3 has no wearing sensor, so the command does not exist
+set +e
+run_cli ear-detect off >/dev/null 2>&1; c_ear=$?
+set -e
+if [[ $c_ear -eq 1 ]]; then
+  pass_test "T1.D9e" "Wearing detection is not offered on the XM3"
+else
+  fail_test "T1.D9e" "ear-detect should be an unknown command" "exit=$c_ear"
 fi
 
 # T1.D9c: Unknown enum values are rejected rather than silently stored

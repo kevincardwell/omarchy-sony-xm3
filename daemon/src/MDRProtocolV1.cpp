@@ -52,7 +52,7 @@ std::string HeadphoneState::toJson() const {
        << "\"clear_bass\":" << clear_bass << ","
        << "\"dsee\":" << (dsee_hx ? "true" : "false") << ","
        << "\"dsee_hx\":" << (dsee_hx ? "true" : "false") << ","
-       << "\"ear_detection\":" << (ear_detection ? "true" : "false") << ","
+       << "\"dsee_hx_active\":" << (dsee_hx_active ? "true" : "false") << ","
        << "\"surround\":\"" << surround << "\","
        << "\"sound_position\":\"" << sound_position << "\","
        << "\"auto_power_off\":\"" << auto_power_off << "\","
@@ -337,18 +337,6 @@ std::vector<uint8_t> serializeDsee(bool enabled, uint8_t seq) {
     return packFrame(PacketType::DATA_MDR, seq, payload);
 }
 
-std::vector<uint8_t> serializeEarDetection(bool enabled, uint8_t seq) {
-    // SYSTEM_SET_PARAM / CONTROL_BY_WEARING. ON = 0x01 here (the v2 table
-    // inverts this, which is a common porting mistake).
-    std::vector<uint8_t> payload = {
-        cmd(Command::SYSTEM_SET_PARAM),
-        static_cast<uint8_t>(SystemInquiredType::CONTROL_BY_WEARING),
-        0x00, // ControlByWearingSettingType::ON_OFF
-        static_cast<uint8_t>(enabled ? 0x01 : 0x00)
-    };
-    return packFrame(PacketType::DATA_MDR, seq, payload);
-}
-
 std::vector<uint8_t> serializeSurround(SurroundPreset preset, uint8_t seq) {
     std::vector<uint8_t> payload = {
         cmd(Command::VPT_SET_PARAM),
@@ -407,6 +395,21 @@ std::vector<uint8_t> query2(Command c, uint8_t type, uint8_t seq) {
 }
 } // namespace
 
+std::vector<uint8_t> serializeQueryProtocolInfo(uint8_t seq) {
+    return query2(Command::CONNECT_GET_PROTOCOL_INFO,
+                  static_cast<uint8_t>(CommonInquiredType::FIXED_VALUE), seq);
+}
+
+std::vector<uint8_t> serializeQueryCapabilityInfo(uint8_t seq) {
+    return query2(Command::CONNECT_GET_CAPABILITY_INFO,
+                  static_cast<uint8_t>(CommonInquiredType::FIXED_VALUE), seq);
+}
+
+std::vector<uint8_t> serializeQuerySupportFunction(uint8_t seq) {
+    return query2(Command::CONNECT_GET_SUPPORT_FUNCTION,
+                  static_cast<uint8_t>(CommonInquiredType::FIXED_VALUE), seq);
+}
+
 std::vector<uint8_t> serializeQueryBattery(uint8_t seq) {
     return query2(Command::COMMON_GET_BATTERY_LEVEL,
                   static_cast<uint8_t>(BatteryInquiredType::BATTERY), seq);
@@ -440,11 +443,6 @@ std::vector<uint8_t> serializeQueryUpscalingEffect(uint8_t seq) {
 std::vector<uint8_t> serializeQueryCodec(uint8_t seq) {
     return query2(Command::COMMON_GET_AUDIO_CODEC,
                   static_cast<uint8_t>(CommonInquiredType::FIXED_VALUE), seq);
-}
-
-std::vector<uint8_t> serializeQueryEarDetection(uint8_t seq) {
-    return query2(Command::SYSTEM_GET_PARAM,
-                  static_cast<uint8_t>(SystemInquiredType::CONTROL_BY_WEARING), seq);
 }
 
 std::vector<uint8_t> serializeQuerySurround(uint8_t seq) {
@@ -491,11 +489,14 @@ bool parseInboundPayload(std::span<const uint8_t> payload, HeadphoneState& state
         state.codec = codecToString(payload[2]);
         updated = true;
     }
-    // 3. DSEE HX availability report (COMMON_RET/NTFY_UPSCALING_EFFECT)
-    //    payload: [cmd, 0x00, effectType, effectStatus] where status VALID = active
+    // 3. DSEE HX activity (COMMON_RET/NTFY_UPSCALING_EFFECT)
+    //    payload: [cmd, 0x00, effectType, effectStatus]; VALID (0x01) = processing.
+    //    This is whether it is running, not whether it is switched on — the
+    //    headset reports INVALID on LDAC even with the setting on — so it must
+    //    never overwrite dsee_hx.
     else if ((c == cmd(Command::COMMON_RET_UPSCALING_EFFECT) ||
               c == cmd(Command::COMMON_NTFY_UPSCALING_EFFECT)) && payload.size() >= 4) {
-        state.dsee_hx = (payload[3] == 0x01);
+        state.dsee_hx_active = (payload[3] == 0x01);
         updated = true;
     }
     // 4. Noise control (NCASM_RET/NTFY_PARAM)
@@ -583,13 +584,11 @@ bool parseInboundPayload(std::span<const uint8_t> payload, HeadphoneState& state
             updated = true;
         }
     }
-    // 9. System params: wearing detection and auto power off (SYSTEM_RET/NTFY_PARAM)
+    // 9. System params: auto power off (SYSTEM_RET/NTFY_PARAM). The XM3 has
+    //    no wearing sensor, so CONTROL_BY_WEARING never appears here.
     else if ((c == cmd(Command::SYSTEM_RET_PARAM) ||
               c == cmd(Command::SYSTEM_NTFY_PARAM)) && payload.size() >= 4) {
-        if (payload[1] == static_cast<uint8_t>(SystemInquiredType::CONTROL_BY_WEARING)) {
-            state.ear_detection = (payload[3] == 0x01);
-            updated = true;
-        } else if (payload[1] == static_cast<uint8_t>(SystemInquiredType::AUTO_POWER_OFF)) {
+        if (payload[1] == static_cast<uint8_t>(SystemInquiredType::AUTO_POWER_OFF)) {
             state.auto_power_off = autoPowerOffToString(static_cast<AutoPowerOff>(payload[3]));
             updated = true;
         }
@@ -717,7 +716,8 @@ AutoPowerOff stringToAutoPowerOff(const std::string& str) {
     if (str == "30min")     return AutoPowerOff::AFTER_30_MIN;
     if (str == "60min")     return AutoPowerOff::AFTER_60_MIN;
     if (str == "180min")    return AutoPowerOff::AFTER_180_MIN;
-    if (str == "on-remove") return AutoPowerOff::WHEN_REMOVED;
+    // "When removed" is deliberately not selectable: it needs the wearing
+    // sensor the XM3 lacks, and the headset ignores it (observed on hardware).
     if (str == "off")       return AutoPowerOff::DISABLED;
     return AutoPowerOff::UNKNOWN;
 }

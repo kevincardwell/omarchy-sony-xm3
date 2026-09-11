@@ -52,6 +52,7 @@ const Model = new Function(
     SURROUND_OFF, SOUND_POSITION_OFF,
     defaultStatus, parseStatus, clamp,
     stepToNoiseMode, isVoiceFocusAvailable, cycleNoiseMode,
+    dspAvailable, connectionModeName, dseeDescription,
     noiseModeName, noiseModeIcon, eqPresetName, eqPresetButtonLabel,
     surroundName, surroundButtonLabel, soundPositionName,
     batteryIcon, formatBattery, levelFraction, elideError
@@ -137,13 +138,15 @@ suite("Suite 3: Full payload parsing", () => {
   check("ambient -> level", amb.ambientSoundLevel, 14);
   check("ambient -> max level", amb.ambientMaxLevel, 19);
   check("ambient -> focus on voice", amb.voicePassthrough, true);
-  check("ambient -> codec", amb.codec, "LDAC");
+  check("ambient -> codec", amb.codec, "SBC");
+  check("ambient -> dsee processing", amb.dseeHxActive, true);
 
   const anc = Model.parseStatus(fixture("status_connected_anc.json"));
   check("anc -> mode", anc.noiseMode, "anc");
   check("anc -> level is step 0", anc.ambientSoundLevel, 0);
   check("anc -> eq preset", anc.eqPreset, "bright");
   check("anc -> dsee hx", anc.dseeHx, true);
+  check("anc -> dsee idle on LDAC", anc.dseeHxActive, false);
 
   const wind = Model.parseStatus(fixture("status_connected_wind.json"));
   check("wind -> mode", wind.noiseMode, "wind");
@@ -226,7 +229,7 @@ suite("Suite 7: Vocabulary shared with the daemon", () => {
   check("sound positions", Model.SOUND_POSITIONS,
         ["off", "front-left", "front-right", "front", "rear-left", "rear-right"]);
   check("auto power off values", Model.AUTO_POWER_OFF_VALUES,
-        ["off", "5min", "30min", "60min", "180min", "on-remove"]);
+        ["off", "5min", "30min", "60min", "180min"]);
   check("connection modes", Model.CONNECTION_MODES, ["quality", "stable"]);
   check("ambient steps start at 2", Model.STEP_AMBIENT_MIN, 2);
   check("default max ambient step", Model.STEP_AMBIENT_MAX_DEFAULT, 19);
@@ -269,6 +272,26 @@ suite("Suite 8: Display formatters", () => {
   check("elideError collapses whitespace", Model.elideError("a  \n b"), "a b");
 });
 
+
+// ---------------------------------------------------------------------------
+suite("Suite 9: LDAC versus the headset's own processing (observed on hardware)", () => {
+  // On "Priority on sound quality" the XM3 refuses EQ and VPT commands.
+  check("EQ/surround unavailable on LDAC", Model.dspAvailable("quality"), false);
+  check("EQ/surround available on stable", Model.dspAvailable("stable"), true);
+  check("unknown mode does not lock the controls", Model.dspAvailable("unknown"), true);
+
+  check("connection name: quality", Model.connectionModeName("quality"), "Sound quality (LDAC)");
+  check("connection name: stable", Model.connectionModeName("stable"), "Stable connection");
+
+  // DSEE HX: the setting and whether it is processing are different things.
+  check("dsee off", Model.dseeDescription(false, false, "quality"), "Restores detail lost to compressed audio");
+  check("dsee on and working", Model.dseeDescription(true, true, "stable"), "Upscaling compressed audio");
+  check("dsee on but idle on LDAC", Model.dseeDescription(true, false, "quality"), "On, idle: LDAC has nothing to restore");
+  check("dsee on but idle behind EQ", Model.dseeDescription(true, false, "stable"), "On, idle while EQ or surround is active");
+
+  const legacy = Model.parseStatus(JSON.stringify({ schema_version: 1, connected: true, ear_detection: false }));
+  check("a stale ear_detection field is ignored, not an error", legacy.ok, true);
+});
 // ---------------------------------------------------------------------------
 console.log(`\nSummary: ${passed} passed, ${failed} failed`);
 if (failed > 0) {

@@ -28,7 +28,6 @@
   "clear_bass": -99,
   "dsee": false,
   "dsee_hx": false,
-  "ear_detection": true,
   "surround": "stadium",
   "sound_position": "above",
   "auto_power_off": "7min",

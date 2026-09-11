@@ -184,8 +184,8 @@ def run_tests():
                 b"dsee fast\n",
                 b"surround\n",
                 b"surround stadium\n",
-                b"ear-detect\n",
-                b"ear-detect true_or_false\n",
+                b"dsee\n",
+                b"dsee true_or_false\n",
             ]
             for cmd in bad_cmds:
                 s.sendall(cmd)
@@ -287,7 +287,7 @@ def run_tests():
                 "voice-focus on\n",
                 "dsee off\n",
                 "surround arena\n",
-                "ear-detect off\n",
+                "dsee off\n",
                 "status\n",
                 "noise off\n"
             ]

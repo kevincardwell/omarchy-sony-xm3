@@ -28,11 +28,11 @@
   "clear_bass": 0,
   "dsee": false,
   "dsee_hx": false,
-  "ear_detection": true,
   "surround": "club",
   "sound_position": "rear-left",
   "auto_power_off": "180min",
   "connection_mode": "quality",
   "codec": "SBC",
-  "last_updated": 1757462400
+  "last_updated": 1757462400,
+  "dsee_hx_active": false
 }

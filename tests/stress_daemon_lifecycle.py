@@ -265,7 +265,7 @@ def test_high_concurrency_ipc(sbox):
             ("dsee on\n", "OK\n"),
             ("voice-focus off\n", "OK\n"),
             ("surround arena\n", "OK\n"),
-            ("ear-detect on\n", "OK\n"),
+            ("dsee on\n", "OK\n"),
             ("eq custom 1 2 3 4 5 2\n", "OK\n"),
             ("status\n", "JSON"),
         ]

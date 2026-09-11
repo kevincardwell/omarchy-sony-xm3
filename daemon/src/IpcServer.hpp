@@ -33,7 +33,6 @@ struct IpcCallbacks {
     std::function<bool(const std::array<int, 5>& bands, int clearBass, std::string& errorMsg)> setCustomEq;
     std::function<bool(bool enabled, std::string& errorMsg)> setVoiceFocus;
     std::function<bool(bool enabled, std::string& errorMsg)> setDsee;
-    std::function<bool(bool enabled, std::string& errorMsg)> setEarDetection;
     std::function<bool(protocol::SurroundPreset preset, std::string& errorMsg)> setSurround;
     std::function<bool(protocol::SoundPosition position, std::string& errorMsg)> setSoundPosition;
     std::function<bool(protocol::AutoPowerOff timer, std::string& errorMsg)> setAutoPowerOff;

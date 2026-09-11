@@ -51,10 +51,10 @@ Steps performed:
   2. Configure and build daemon and CLI using CMake and Ninja:
      cmake -B build -G Ninja && cmake --build build
   3. Install sony-xm3-daemon and sony-xm3-ctl into ~/.local/bin (mode 0755).
-  4. Copy daemon/sony-xm3.service to ~/.config/systemd/user/,
-     reload systemd daemon, and enable the service unit.
-  5. Deploy plugin/ to ~/.local/share/omarchy/shell/plugins/io.github.kevincardwell.omasonyxm3,
-     verify no symlinks exist, and validate via omarchy-plugin-validate if present.
+  4. Copy daemon/sony-xm3.service to ~/.config/systemd/user/, then enable
+     and (re)start it.
+  5. Deploy the plugin to ~/.config/omarchy/plugins/io.github.kevincardwell.omasonyxm3,
+     validate it, enable it next to the volume control, and restart the shell.
 HELP_EOF
 }
 
@@ -179,42 +179,44 @@ install_systemd_service() {
   mkdir -p "$service_dir"
   install -m 0644 "$service_src" "$service_dest"
 
-  info "Reloading systemd user daemon and enabling sony-xm3.service..."
   systemctl --user daemon-reload 2>/dev/null || true
-  systemctl --user enable sony-xm3.service 2>/dev/null || true
-  success "Systemd user service installed and enabled."
+  # enable --now starts it immediately; restart covers re-running setup over an
+  # existing install, which would otherwise keep running the old binary.
+  systemctl --user enable --now sony-xm3.service 2>/dev/null || true
+  systemctl --user restart sony-xm3.service 2>/dev/null || true
+  success "sony-xm3.service installed, enabled and running."
 }
+
+readonly PLUGIN_ID="io.github.kevincardwell.omasonyxm3"
 
 deploy_plugin() {
   info "Deploying Omarchy bar-widget plugin..."
-  local plugins_dir="$HOME/.local/share/omarchy/shell/plugins"
-  local plugin_dest="$plugins_dir/io.github.kevincardwell.omasonyxm3"
-  local user_plugins_dir="$HOME/.config/omarchy/plugins"
-  local user_plugin_dest="$user_plugins_dir/io.github.kevincardwell.omasonyxm3"
+  # The only directory Omarchy scans for user plugins.
+  local plugin_dest="$HOME/.config/omarchy/plugins/$PLUGIN_ID"
 
-  mkdir -p "$plugin_dest" "$user_plugin_dest"
-  rm -rf "$plugin_dest"/* "$user_plugin_dest"/*
-
+  mkdir -p "$plugin_dest"
+  rm -rf "${plugin_dest:?}"/*
   for file in manifest.json Panel.qml Service.qml Model.js SonyIcon.qml; do
-    if [[ -f "$ROOT_DIR/$file" ]]; then
-      cp "$ROOT_DIR/$file" "$plugin_dest/"
-      cp "$ROOT_DIR/$file" "$user_plugin_dest/"
-    fi
+    cp "$ROOT_DIR/$file" "$plugin_dest/"
   done
 
-  # Validate plugin if validator is present
-  local validator="/usr/share/omarchy/bin/omarchy-plugin-validate"
-  if [[ -x "$validator" ]]; then
-    info "Validating plugin using $validator..."
-    "$validator" "$ROOT_DIR"
-    success "Plugin validation passed."
-  fi
-
-  success "Plugin deployed to $plugin_dest and $user_plugin_dest."
-
   if command -v omarchy >/dev/null 2>&1; then
-    info "Enabling plugin io.github.kevincardwell.omasonyxm3 in Omarchy..."
-    omarchy plugin enable io.github.kevincardwell.omasonyxm3 2>/dev/null || true
+    omarchy plugin validate "$plugin_dest"
+    success "Plugin validated and deployed to $plugin_dest."
+
+    # A plugin dropped into the directory is not known until the shell rescans.
+    omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true
+    sleep 1
+    info "Enabling $PLUGIN_ID next to the volume control..."
+    omarchy plugin enable "$PLUGIN_ID" --after omarchy.audio 2>/dev/null \
+      || omarchy plugin enable "$PLUGIN_ID" --section right 2>/dev/null \
+      || warn "Could not enable the plugin automatically; run: omarchy plugin enable $PLUGIN_ID"
+
+    # Hot reload does not reliably load new or changed QML; a restart does.
+    info "Restarting the Omarchy shell to load the widget..."
+    omarchy restart shell >/dev/null 2>&1 || warn "Restart the shell yourself: omarchy restart shell"
+  else
+    success "Plugin deployed to $plugin_dest (omarchy CLI not found; enable it manually)."
   fi
 }
 

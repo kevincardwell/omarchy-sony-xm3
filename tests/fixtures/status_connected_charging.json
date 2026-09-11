@@ -28,11 +28,11 @@
   "clear_bass": 1,
   "dsee": false,
   "dsee_hx": false,
-  "ear_detection": true,
   "surround": "off",
   "sound_position": "off",
   "auto_power_off": "off",
   "connection_mode": "quality",
   "codec": "AAC",
-  "last_updated": 1757462400
+  "last_updated": 1757462400,
+  "dsee_hx_active": false
 }

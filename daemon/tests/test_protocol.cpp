@@ -2,6 +2,7 @@
 #include "BluetoothManager.hpp"
 #include "StateEngine.hpp"
 #include "IpcServer.hpp"
+#include "CommandQueue.hpp"
 
 #include <iostream>
 #include <fstream>
@@ -319,13 +320,16 @@ void testCommandSerializers() {
         TEST_ASSERT_EQ(static_cast<int>(off[3]), 0x00, "DSEE HX off must send value 0");
     }
 
-    // --- Wearing detection: CONTROL_BY_WEARING = 0x03, ON = 0x01 -----------
+    // --- Session handshake ---------------------------------------------------
+    //     Without these the XM3 ACKs parameter queries but never answers them
+    //     (observed on hardware, 2026-09-11).
     {
-        auto on  = payloadOf(serializeEarDetection(true, 0));
-        auto off = payloadOf(serializeEarDetection(false, 0));
-        std::vector<uint8_t> expectOn = {0xF8, 0x03, 0x00, 0x01};
-        TEST_ASSERT(on == expectOn, "Ear detection on must be [0xF8, 0x03, 0x00, 0x01]");
-        TEST_ASSERT_EQ(static_cast<int>(off[3]), 0x00, "Ear detection off must send value 0");
+        std::vector<uint8_t> protocol = {0x00, 0x00};
+        std::vector<uint8_t> capability = {0x02, 0x00};
+        std::vector<uint8_t> support = {0x06, 0x00};
+        TEST_ASSERT(payloadOf(serializeQueryProtocolInfo(0)) == protocol, "Handshake 1 is CONNECT_GET_PROTOCOL_INFO");
+        TEST_ASSERT(payloadOf(serializeQueryCapabilityInfo(0)) == capability, "Handshake 2 is CONNECT_GET_CAPABILITY_INFO");
+        TEST_ASSERT(payloadOf(serializeQuerySupportFunction(0)) == support, "Handshake 3 is CONNECT_GET_SUPPORT_FUNCTION");
     }
 
     // --- VPT surround and sound position -----------------------------------
@@ -392,7 +396,6 @@ void testQuerySerializers() {
         {serializeQueryDsee(0),             {0xE6, 0x02}, "dsee hx"},
         {serializeQueryUpscalingEffect(0),  {0x14, 0x00}, "upscaling effect"},
         {serializeQueryCodec(0),            {0x18, 0x00}, "audio codec"},
-        {serializeQueryEarDetection(0),     {0xF6, 0x03}, "ear detection"},
         {serializeQuerySurround(0),         {0x46, 0x01}, "surround"},
         {serializeQuerySoundPosition(0),    {0x46, 0x02}, "sound position"},
         {serializeQueryAutoPowerOff(0),     {0xF6, 0x04}, "auto power off"},
@@ -524,16 +527,68 @@ void testInboundStateParser() {
         TEST_ASSERT(s.connection_mode == "stable", "Connection mode 0x01 prioritises a stable link");
     }
 
-    // --- System params: wearing detection and auto power off ----------------
+    // --- System params: auto power off ---------------------------------------
     {
         HeadphoneState s;
+        // The XM3 has no wearing sensor; a stray CONTROL_BY_WEARING frame must
+        // be ignored rather than half-parsed into some other field.
         std::vector<uint8_t> wearing = {0xF7, 0x03, 0x00, 0x00};
-        parseInboundPayload(wearing, s);
-        TEST_ASSERT(!s.ear_detection, "CONTROL_BY_WEARING value 0 disables ear detection");
+        TEST_ASSERT(!parseInboundPayload(wearing, s), "CONTROL_BY_WEARING is not an XM3 setting");
 
         std::vector<uint8_t> apo = {0xF7, 0x04, 0x01, 0x11, 0x03};
         parseInboundPayload(apo, s);
         TEST_ASSERT(s.auto_power_off == "off", "Auto power off element 0x11 is disabled");
+    }
+
+    // --- Real WH-1000XM3 traffic, captured 2026-09-11 ------------------------
+    {
+        HeadphoneState s;
+
+        std::vector<uint8_t> cap = {0x61, 0x02, 0x02, 0x00, 0x01, 0x02, 0x00, 0x14, 0x01, 0x14};
+        TEST_ASSERT(parseInboundPayload(cap, s), "Captured NC/ASM capability must parse");
+        TEST_ASSERT_EQ(s.ambient_max_level, 19, "Captured capability: 20 steps, top index 19");
+
+        std::vector<uint8_t> battery = {0x11, 0x00, 0x46, 0x00};
+        parseInboundPayload(battery, s);
+        TEST_ASSERT_EQ(s.battery_level, 70, "Captured battery: 70%");
+
+        // The headset reports effect ON (0x01) and ncType DUAL_SINGLE_OFF (0x02)
+        // even though we send ADJUST_COMPLETE and LEVEL_ADJUSTMENT.
+        std::vector<uint8_t> anc = {0x67, 0x02, 0x01, 0x02, 0x02, 0x01, 0x00, 0x00};
+        parseInboundPayload(anc, s);
+        TEST_ASSERT(s.noise_mode == "anc", "Captured NC/ASM reply decodes as ANC");
+
+        std::vector<uint8_t> ambient = {0x69, 0x02, 0x01, 0x02, 0x00, 0x01, 0x01, 0x0a};
+        parseInboundPayload(ambient, s);
+        TEST_ASSERT(s.noise_mode == "ambient", "Captured notify decodes as ambient");
+        TEST_ASSERT_EQ(s.ambient_sound_level, 10, "Captured notify: ambient step 10");
+        TEST_ASSERT(s.voice_passthrough, "Captured notify: Focus on Voice on");
+
+        std::vector<uint8_t> codec = {0x1b, 0x00, 0x10};
+        parseInboundPayload(codec, s);
+        TEST_ASSERT(s.codec == "LDAC", "Captured codec notify: LDAC");
+
+        std::vector<uint8_t> mode = {0xe7, 0x01, 0x00, 0x01};
+        parseInboundPayload(mode, s);
+        TEST_ASSERT(s.connection_mode == "stable", "Captured connection mode: stable");
+
+        // DSEE HX switched on, then the headset reports it INVALID because the
+        // link is LDAC. The setting must survive; only the activity flag drops.
+        std::vector<uint8_t> dseeOn = {0xe9, 0x02, 0x00, 0x01};
+        std::vector<uint8_t> dseeInvalid = {0x17, 0x00, 0x00, 0x02};
+        parseInboundPayload(dseeOn, s);
+        parseInboundPayload(dseeInvalid, s);
+        TEST_ASSERT(s.dsee_hx, "An INVALID upscaling indicator must not switch the DSEE HX setting off");
+        TEST_ASSERT(!s.dsee_hx_active, "INVALID upscaling indicator means DSEE HX is not processing");
+
+        std::vector<uint8_t> dseeValid = {0x17, 0x00, 0x00, 0x01};
+        parseInboundPayload(dseeValid, s);
+        TEST_ASSERT(s.dsee_hx_active, "VALID upscaling indicator means DSEE HX is processing");
+
+        std::vector<uint8_t> eqBass = {0x59, 0x01, 0x16, 0x06, 0x11, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a};
+        parseInboundPayload(eqBass, s);
+        TEST_ASSERT(s.eq_preset == "bass", "Captured EQ notify: Bass Boost");
+        TEST_ASSERT_EQ(s.clear_bass, 7, "Captured EQ notify: Bass Boost carries Clear Bass +7");
     }
 
     // --- Malformed and unknown payloads must be rejected, not crash ---------
@@ -591,7 +646,7 @@ void testStringAndEnumHelpers() {
                     std::string("Sound position round trip failed for ") + v);
     }
 
-    const char* timers[] = {"off", "5min", "30min", "60min", "180min", "on-remove"};
+    const char* timers[] = {"off", "5min", "30min", "60min", "180min"};
     for (const char* v : timers) {
         TEST_ASSERT(autoPowerOffToString(stringToAutoPowerOff(v)) == v,
                     std::string("Auto power off round trip failed for ") + v);
@@ -855,13 +910,13 @@ void testIpcServer() {
     TEST_ASSERT_EQ(server.handleCommandLine("eq user1"), "OK\n", "eq user1 valid");
     TEST_ASSERT_EQ(server.handleCommandLine("voice-focus on"), "OK\n", "voice-focus on valid");
     TEST_ASSERT_EQ(server.handleCommandLine("dsee off"), "OK\n", "dsee off valid");
-    TEST_ASSERT_EQ(server.handleCommandLine("ear-detect off"), "OK\n", "ear-detect off valid");
-    TEST_ASSERT_EQ(server.handleCommandLine("ear-detection on"), "OK\n", "ear-detection on valid");
+    TEST_ASSERT(server.handleCommandLine("ear-detect off").rfind("ERR unknown command", 0) == 0, "the XM3 has no wearing sensor");
     TEST_ASSERT_EQ(server.handleCommandLine("surround club"), "OK\n", "surround club valid");
     TEST_ASSERT(server.handleCommandLine("surround stadium").rfind("ERR unknown surround preset", 0) == 0, "unknown surround rejected");
     TEST_ASSERT_EQ(server.handleCommandLine("sound-position front-left"), "OK\n", "sound-position front-left valid");
     TEST_ASSERT(server.handleCommandLine("sound-position above").rfind("ERR unknown sound position", 0) == 0, "unknown sound position rejected");
-    TEST_ASSERT_EQ(server.handleCommandLine("auto-power-off on-remove"), "OK\n", "auto-power-off on-remove valid");
+    TEST_ASSERT_EQ(server.handleCommandLine("auto-power-off 180min"), "OK\n", "auto-power-off 180min valid");
+    TEST_ASSERT(server.handleCommandLine("auto-power-off on-remove").rfind("ERR unknown auto power off", 0) == 0, "on-remove needs a wearing sensor the XM3 lacks");
     TEST_ASSERT(server.handleCommandLine("auto-power-off 7min").rfind("ERR unknown auto power off", 0) == 0, "unknown auto power off rejected");
     TEST_ASSERT_EQ(server.handleCommandLine("connection stable"), "OK\n", "connection stable valid");
     TEST_ASSERT(server.handleCommandLine("connection fast").rfind("ERR unknown connection mode", 0) == 0, "unknown connection mode rejected");
@@ -1007,6 +1062,74 @@ void testIpcServer() {
 }
 
 // ---------------------------------------------------------------------------
+// 12. Command queue: one frame in flight, sequence taken from ACKs only
+//
+// Both behaviours were found on real hardware, where every offline test had
+// passed: the XM3 silently drops frames sent before the previous ACK, and
+// taking the sequence number from its notifications made the next command
+// time out before its retry landed.
+// ---------------------------------------------------------------------------
+void testCommandQueue() {
+    TEST_CASE("CommandQueue");
+
+    std::vector<UnpackedFrame> sent;
+    CommandQueue q([&](const std::vector<uint8_t>& frame) {
+        auto f = unpackFrame(frame);
+        if (f) sent.push_back(*f);
+    });
+
+    // --- One in flight ------------------------------------------------------
+    q.enqueue(serializeQueryBattery(), "a");
+    q.enqueue(serializeQueryNoiseMode(), "b");
+    q.enqueue(serializeQueryEq(), "c");
+    TEST_ASSERT_EQ(sent.size(), static_cast<size_t>(1), "Only the first command may be sent before an ACK");
+    TEST_ASSERT_EQ(static_cast<int>(sent[0].seq), 0, "First command uses sequence 0");
+    TEST_ASSERT_EQ(q.queued(), static_cast<size_t>(2), "The other two wait");
+
+    // --- The ACK releases the next, and names its sequence number -----------
+    q.onFrame(PacketType::ACK, 1);
+    TEST_ASSERT_EQ(sent.size(), static_cast<size_t>(2), "An ACK releases exactly one more command");
+    TEST_ASSERT_EQ(static_cast<int>(sent[1].seq), 1, "The next command takes the ACK's sequence number");
+    TEST_ASSERT_EQ(static_cast<int>(sent[1].payload[0]), 0x66, "Commands go out in the order queued");
+
+    // --- Headset notifications must not move the sequence -------------------
+    q.onFrame(PacketType::DATA_MDR, 1);   // reply to the query
+    q.onFrame(PacketType::DATA_MDR, 0);   // an unrelated volume notification
+    TEST_ASSERT_EQ(sent.size(), static_cast<size_t>(2), "DATA frames never release the next command");
+    q.onFrame(PacketType::ACK, 0);
+    TEST_ASSERT_EQ(static_cast<int>(sent[2].seq), 0, "Sequence follows the ACK, not the notifications before it");
+
+    q.onFrame(PacketType::ACK, 1);
+    TEST_ASSERT(!q.busy(), "Queue is idle once everything is ACKed");
+    q.onFrame(PacketType::DATA_MDR, 0);
+    TEST_ASSERT_EQ(static_cast<int>(q.nextSeq()), 1, "An idle queue keeps the last ACK's sequence despite notifications");
+
+    // --- A lost ACK: retry with the sequence bit flipped ---------------------
+    sent.clear();
+    q.enqueue(serializeQueryCodec(), "retry");
+    TEST_ASSERT_EQ(static_cast<int>(sent[0].seq), 1, "Sent with the expected sequence");
+    q.tick(CommandQueue::Clock::now());
+    TEST_ASSERT_EQ(sent.size(), static_cast<size_t>(1), "No retry before the ACK timeout");
+    q.tick(CommandQueue::Clock::now() + std::chrono::seconds(2));
+    TEST_ASSERT_EQ(sent.size(), static_cast<size_t>(2), "Retry once the ACK timeout passes");
+    TEST_ASSERT_EQ(static_cast<int>(sent[1].seq), 0, "The retry flips the sequence bit");
+    TEST_ASSERT(sent[1].payload == sent[0].payload, "The retry resends the same command");
+
+    // --- Give up after the retry budget and move on -------------------------
+    q.enqueue(serializeQueryEq(), "after-drop");
+    for (int i = 0; i < 5; ++i) q.tick(CommandQueue::Clock::now() + std::chrono::seconds(2));
+    TEST_ASSERT(q.busy(), "The queue moves on to the next command after dropping one");
+    TEST_ASSERT_EQ(static_cast<int>(sent.back().payload[0]), 0x56, "The next command is the one queued behind it");
+
+    // --- Reset on disconnect -------------------------------------------------
+    q.reset();
+    TEST_ASSERT(!q.busy() && q.queued() == 0, "reset() clears everything");
+    TEST_ASSERT_EQ(static_cast<int>(q.nextSeq()), 0, "reset() restarts the sequence at 0");
+
+    TEST_PASS("CommandQueue");
+}
+
+// ---------------------------------------------------------------------------
 // Main Runner
 // ---------------------------------------------------------------------------
 int main() {
@@ -1025,6 +1148,7 @@ int main() {
     testMockTransportAndBluetoothManager();
     testStateEngine();
     testIpcServer();
+    testCommandQueue();
 
     std::cout << "========================================\n";
     std::cout << "Summary: " << (gTotalTests - gFailedTests) << "/" << gTotalTests

@@ -33,12 +33,11 @@ checks for an adapter and a paired headset and warns you if either is missing.
 - 🎧 **Noise control** — Noise Cancelling, Wind Noise Reduction, Ambient Sound, and Off.
 - 🔊 **Ambient sound slider** — the XM3's full passthrough range, with Focus on Voice.
 - 🎛️ **Equalizer** — the nine presets plus Manual (5 bands + Clear Bass) and the two saved user slots.
-- 🎚️ **DSEE HX** — the XM3's audio upscaling.
+- 📶 **Bluetooth priority** — LDAC ("sound quality") or stable connection, switchable from the panel.
+- 🎚️ **DSEE HX** — the XM3's upscaling, with an honest "on but idle" state (it switches itself off on LDAC).
 - 🎪 **Surround (VPT)** — Outdoor Festival, Arena, Concert Hall, Club.
 - 🧭 **Sound position** — front, front L/R, rear L/R.
-- ⏻ **Auto power off** — 5 / 30 / 60 / 180 min, on-removal, or disabled.
-- 👂 **Wearing detection** — pause playback when the headphones come off.
-- 📶 **Link preference** — LDAC sound quality vs. stable connection.
+- ⏻ **Auto power off** — 5 / 30 / 60 / 180 min, or disabled.
 - ⌨️ **Keyboard navigation** — vim-style (`h`/`j`/`k`/`l`, `Enter`, `Esc`) in the panel.
 - 💻 **CLI (`sony-xm3-ctl`)** — everything the panel does, scriptable.
 - ⚡ **No polling** — native BlueZ RFCOMM plus a file-watched state file.
@@ -163,10 +162,9 @@ sony-xm3-ctl eq custom 0 2 4 2 0 5     # 5 bands then Clear Bass, each -10..10
 
 # Everything else
 sony-xm3-ctl dsee on                   # DSEE HX
-sony-xm3-ctl ear-detect on             # pause when removed
 sony-xm3-ctl surround concert          # off|outdoor|arena|concert|club
 sony-xm3-ctl sound-position front      # off|front-left|front-right|front|rear-left|rear-right
-sony-xm3-ctl auto-power-off 180min     # off|5min|30min|60min|180min|on-remove
+sony-xm3-ctl auto-power-off 180min     # off|5min|30min|60min|180min
 sony-xm3-ctl connection quality        # quality|stable
 ```
 
@@ -216,6 +214,52 @@ python3 tests/challenger_stress.py
 
 ---
 
+## LDAC or EQ: the XM3 makes you choose
+
+The headset has two Bluetooth priorities, and they are a real trade-off, not a
+preference:
+
+| | Sound quality (LDAC) | Stable connection |
+|---|---|---|
+| Codec | LDAC, up to 990 kbps | SBC |
+| Headset EQ, surround, sound position | **unavailable** | available |
+| DSEE HX | idle (nothing to restore) | active |
+
+On "sound quality" the XM3 does not apply EQ or surround at all — sent anyway,
+it answers with a prompt to change connection mode instead. The panel greys
+those sections out and says why; the CLI refuses them with the same
+explanation.
+
+**For the best sound, stay on "sound quality"** and, if you want EQ, do it on the
+PC with [EasyEffects](https://github.com/wwmm/easyeffects) — that applies before
+the audio is encoded, so you keep LDAC.
+
+### Getting the full 990 kbps
+
+PipeWire runs LDAC adaptively by default and drops to 660 or 330 kbps whenever it
+judges the link marginal. To pin it at the top rate for this headset, drop a file
+in `~/.config/wireplumber/wireplumber.conf.d/`:
+
+```
+monitor.bluez.rules = [
+  {
+    matches = [ { device.name = "bluez_card.XX_XX_XX_XX_XX_XX" } ]
+    actions = { update-props = { bluez5.a2dp.ldac.quality = "hq" } }
+  }
+]
+```
+
+Use your headset's address, then `systemctl --user restart wireplumber`.
+
+### If you hear faint periodic glitches
+
+Combo WiFi/Bluetooth cards (the Intel AX210 and friends) share one 2.4 GHz
+radio. A WiFi interface that is enabled but not connected makes NetworkManager
+scan for networks every few minutes, and every scan briefly takes the radio away
+from your audio. If you are on ethernet, `nmcli radio wifi off` fixes it.
+
+---
+
 ## Why this is a port, not a config change
 
 The XM3 speaks Sony's **v1** MDR command table; the XM5 speaks **v2**. Same
@@ -229,14 +273,15 @@ command sent to an XM3 is accepted and silently ignored, so the failure mode is
 | NC/ASM | type `0x02`, 8-byte payload, one step axis | type `0x17`, 7-byte payload, discrete modes |
 | EQ inquired type | `0x01` | `0x00` |
 | Upscaling inquired type | `0x02` (DSEE HX) | `0x01` (DSEE Extreme) |
-| Wearing detection | type `0x03`, ON = `0x01` | type `0x01`, ON = `0x00` |
+| Wearing detection | not on the XM3 (no sensor) | type `0x01`, ON = `0x00` |
 | Speak-to-Chat | — | supported |
 | Multipoint | — | supported |
-| Surround / sound position | supported | — |
+| Surround / sound position | supported (not while on LDAC) | — |
+| Session handshake | required before any settings query | — |
 | Service UUID | `96CC203E-…` | `956C7B26-…` |
 
-Speak-to-Chat and Multipoint are gone from this build because the XM3 has
-neither; Surround, Sound Position, Auto Power Off and the LDAC link preference
+Speak-to-Chat, Multipoint and wearing detection are gone from this build
+because the XM3 has none of them; Surround, Sound Position, Auto Power Off and the LDAC link preference
 are new because it does have those.
 
 Full byte-level detail: [docs/protocol-v1.md](docs/protocol-v1.md).

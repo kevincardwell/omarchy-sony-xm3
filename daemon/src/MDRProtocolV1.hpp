@@ -62,8 +62,12 @@ enum class PacketType : uint8_t {
 enum class Command : uint8_t {
     CONNECT_GET_PROTOCOL_INFO   = 0x00,
     CONNECT_RET_PROTOCOL_INFO   = 0x01,
+    CONNECT_GET_CAPABILITY_INFO = 0x02,
+    CONNECT_RET_CAPABILITY_INFO = 0x03,
     CONNECT_GET_DEVICE_INFO     = 0x04,
     CONNECT_RET_DEVICE_INFO     = 0x05,
+    CONNECT_GET_SUPPORT_FUNCTION= 0x06,
+    CONNECT_RET_SUPPORT_FUNCTION= 0x07,
 
     COMMON_GET_BATTERY_LEVEL    = 0x10,
     COMMON_RET_BATTERY_LEVEL    = 0x11,
@@ -211,8 +215,11 @@ struct HeadphoneState {
     std::string eq_preset = "off";
     std::array<int, 5> eq_custom_bands = {0, 0, 0, 0, 0}; // [-10, 10]
     int clear_bass = 0;                 // [-10, 10]
-    bool dsee_hx = false;               // DSEE HX upscaling
-    bool ear_detection = true;          // pause playback when removed
+    bool dsee_hx = false;               // DSEE HX setting (user's choice)
+    // Whether DSEE HX is actually processing right now. The headset disables it
+    // by itself on LDAC and while EQ or VPT is active, so this can be false
+    // while dsee_hx is true.
+    bool dsee_hx_active = false;
     std::string surround = "off";       // VPT preset
     std::string sound_position = "off"; // VPT sound position
     std::string auto_power_off = "unknown";
@@ -273,11 +280,20 @@ std::vector<uint8_t> serializeAmbientLevel(uint8_t level, bool voiceFocus = fals
 std::vector<uint8_t> serializeEqPreset(EqPreset preset, uint8_t seq = 0);
 std::vector<uint8_t> serializeCustomEq(const std::array<int, 5>& bands, int clearBass, uint8_t seq = 0);
 std::vector<uint8_t> serializeDsee(bool enabled, uint8_t seq = 0);
-std::vector<uint8_t> serializeEarDetection(bool enabled, uint8_t seq = 0);
 std::vector<uint8_t> serializeSurround(SurroundPreset preset, uint8_t seq = 0);
 std::vector<uint8_t> serializeSoundPosition(SoundPosition position, uint8_t seq = 0);
 std::vector<uint8_t> serializeAutoPowerOff(AutoPowerOff timer, uint8_t seq = 0);
 std::vector<uint8_t> serializeConnectionMode(ConnectionMode mode, uint8_t seq = 0);
+
+// ---------------------------------------------------------------------------
+// Session handshake (Host -> XM3)
+//
+// The headset ACKs parameter queries sent before this handshake but does not
+// answer them. Sony's app always opens with these three, in this order.
+// ---------------------------------------------------------------------------
+std::vector<uint8_t> serializeQueryProtocolInfo(uint8_t seq = 0);
+std::vector<uint8_t> serializeQueryCapabilityInfo(uint8_t seq = 0);
+std::vector<uint8_t> serializeQuerySupportFunction(uint8_t seq = 0);
 
 // ---------------------------------------------------------------------------
 // Query Serializers (Host -> XM3 initialization)
@@ -289,7 +305,6 @@ std::vector<uint8_t> serializeQueryEq(uint8_t seq = 0);
 std::vector<uint8_t> serializeQueryDsee(uint8_t seq = 0);
 std::vector<uint8_t> serializeQueryUpscalingEffect(uint8_t seq = 0);
 std::vector<uint8_t> serializeQueryCodec(uint8_t seq = 0);
-std::vector<uint8_t> serializeQueryEarDetection(uint8_t seq = 0);
 std::vector<uint8_t> serializeQuerySurround(uint8_t seq = 0);
 std::vector<uint8_t> serializeQuerySoundPosition(uint8_t seq = 0);
 std::vector<uint8_t> serializeQueryAutoPowerOff(uint8_t seq = 0);

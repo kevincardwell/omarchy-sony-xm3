@@ -9,6 +9,10 @@ Everything here is derived from two open-source reverse-engineering efforts:
 - [Plutoberth/SonyHeadphonesClient](https://github.com/Plutoberth/SonyHeadphonesClient) — the original XM3 client (archived).
 - [mos9527/SonyHeadphonesClient](https://github.com/mos9527/SonyHeadphonesClient) — its successor, whose `libmdr/include/mdr/ProtocolV1T1.hpp` is a machine-generated transcription of Sony Sound Connect's own message tables.
 
+and then checked against a real WH-1000XM3 on 2026-09-11. Where the hardware
+disagreed with the tables, or with my reading of them, the hardware wins and the
+section says so. Captured frames from that session are in the unit tests.
+
 ---
 
 ## Transport
@@ -17,7 +21,7 @@ Everything here is derived from two open-source reverse-engineering efforts:
 |---|---|
 | Link | Bluetooth Classic, RFCOMM |
 | Service UUID | `96CC203E-5068-46AD-B32D-E316F5E069BA` |
-| Channel | Resolved per device over SDP; commonly 9 |
+| Channel | Resolved per device over SDP — **15** on the test XM3 |
 
 The XM5-generation UUID is `956C7B26-D49A-4BA8-B03F-B17D393CB6E2`. The daemon
 refuses to attach to a device that advertises only that one — a v2 headset will
@@ -63,6 +67,65 @@ An ACK is a payload-less frame of type `0x01` carrying the *inverted* sequence
 number of the frame being acknowledged. The daemon ACKs every inbound
 `DATA_MDR` frame.
 
+The XM5 code this project started from hardcodes RFCOMM channel 9. The test
+XM3 had its control service on channel 15, so a hardcoded channel would never
+have connected.
+
+---
+
+## Session handshake (required)
+
+Before it will answer any settings query, the XM3 wants three messages, in this
+order — the same opening Sony's app uses:
+
+```
+0x00 0x00     CONNECT_GET_PROTOCOL_INFO    -> 01 00 40 10   (protocol 0x4010)
+0x02 0x00     CONNECT_GET_CAPABILITY_INFO  -> 03 00 …        (includes the MAC as text)
+0x06 0x00     CONNECT_GET_SUPPORT_FUNCTION -> 07 00 <n> <function ids…>
+```
+
+Without them the headset still **ACKs** every query — so the link looks healthy —
+but never replies. The one exception observed was `NCASM_GET_CAPABILITY`, which
+it answers either way; that is why a missing handshake can pass for a partly
+working daemon.
+
+The support-function list from the test XM3:
+
+| Id | Function | | Id | Function |
+|---|---|---|---|---|
+| `0x11` | Battery level | | `0x42` | Sound position |
+| `0x12` | Upscaling indicator | | `0x51` | Preset EQ |
+| `0x13` | Codec indicator | | `0x71` | Adaptive Sound Control |
+| `0x14` | BLE setup | | `0x81` | NC Optimizer |
+| `0x30` | Firmware update | | `0xa1` | Playback controller |
+| `0x39` | Voice guidance | | `0xc1` | Action log |
+| `0x41` | VPT (surround) | | `0xd1`, `0xd2` | General settings 1, 2 |
+| `0x62` | NC + ambient sound | | `0xe1` | Connection mode |
+| `0xe2` | Upscaling | | `0xf4` | Auto power off |
+
+Notably absent: `0xf3` (control by wearing). The XM3 has no wearing sensor.
+
+---
+
+## Flow control
+
+**One command in flight.** Send a `DATA_MDR` frame, then wait for the headset's
+ACK before sending the next. Anything sent before that ACK is silently dropped —
+send eleven queries back to back and exactly one gets answered.
+
+**The next sequence number comes from the ACK, and only the ACK.** The headset
+numbers its own `DATA` frames (replies and notifications such as volume changes)
+independently. Taking the sequence number from those — which one reference
+client does — puts the next command out of step, and it is only accepted on the
+retry after a one-second timeout.
+
+**On an ACK timeout, flip the sequence bit and resend.** That is how Sony's
+client recovers from a lost ACK, and it is what rescued the out-of-step commands
+above.
+
+Replies usually arrive *after* the ACK, so the reply to one query tends to land
+just after the next query has gone out. That is normal.
+
 ---
 
 ## Command bytes (payload byte 0)
@@ -98,7 +161,8 @@ the headset accepts the frame and does nothing.
 | NC/ASM inquired type | `0x02` (NC **and** ASM), 8-byte payload | `0x17` (dual-mode switch), 7-byte payload |
 | EQ inquired type | `PRESET_EQ = 0x01` | `PRESET_EQ = 0x00` |
 | Upscaling inquired type | `UPSCALING = 0x02` | `UPSCALING = 0x01` |
-| Wearing detection | `CONTROL_BY_WEARING = 0x03`, ON = `0x01` | `PLAYBACK_CONTROL_BY_WEARING = 0x01`, ON = `0x00` |
+| Wearing detection | not on the XM3 (no sensor) | `PLAYBACK_CONTROL_BY_WEARING = 0x01`, ON = `0x00` |
+| Session handshake | required before settings queries | — |
 | Speak-to-Chat | not supported | `SMART_TALKING_MODE_TYPE2 = 0x0C` |
 | Multipoint | not supported | `GENERAL_SETTING1` |
 
@@ -142,7 +206,11 @@ So the four user-facing modes are:
 | Off | `0x00` | `0x00` | `0xFF` |
 
 `NCASM_RET_PARAM` (`0x67`) and `NCASM_NTFY_PARAM` (`0x69`) return the same
-8-byte shape.
+8-byte shape — all four modes were confirmed this way on hardware. The headset
+normalises two fields in what it reports back: `effect` comes back as `0x01`
+rather than the `0x11` sent, and `ncSettingType` as `0x02` rather than `0x01`.
+So `68 02 11 01 00 01 00 0c` (ambient 12) is confirmed as
+`69 02 01 02 00 01 00 0c`. A decoder should key off `ncValue`, not those two.
 
 ### Capability
 
@@ -219,9 +287,18 @@ Both live under `AUDIO_SET_PARAM`:
 0xE8 0x01 0x00 <0|1>      link: 0 = sound quality, 1 = stable connection
 ```
 
-`COMMON_GET_UPSCALING_EFFECT` (`0x14 0x00`) reports whether upscaling is
-*currently active*, which is a different question from whether the setting is
-on — DSEE HX does nothing on an already-lossless source.
+`COMMON_GET_UPSCALING_EFFECT` (`0x14 0x00`, notified as `0x17`) reports whether
+upscaling is *currently active*, which is a different question from whether the
+setting is on:
+
+```
+17 00 00 01     DSEE HX processing
+17 00 00 02     DSEE HX switched on but not processing
+```
+
+The headset reports `02` on LDAC, and also while EQ or surround is active. Treat
+it as a status light, never as the setting — reading it as the setting makes the
+toggle flip itself off the moment you switch to LDAC.
 
 ---
 
@@ -243,10 +320,33 @@ on — DSEE HX does nothing on an already-lossless source.
 
 ---
 
+## LDAC blocks EQ and VPT
+
+On "Priority on sound quality" (`e8 01 00 00`, LDAC) the XM3 cannot run its EQ
+or VPT processing. An EQ, surround or sound-position command sent in that mode
+is ACKed, not applied, and answered with an alert:
+
+```
+99 01 01 01     ALERT_NTFY_PARAM
+                  type    0x01  FIXED_MESSAGE
+                  message 0x01  DISCONNECT_CAUSED_BY_CONNECTION_MODE_CHANGE
+                  action  0x01  POSITIVE_NEGATIVE
+```
+
+i.e. "this needs the connection mode changed, which will disconnect — proceed?"
+Sony's app shows that as a dialog and replies with `ALERT_SET_PARAM`
+(`98 01 01 <0|1>`). The daemon never provokes it: it refuses EQ and VPT
+commands while the headset is on LDAC and says why.
+
+Switching to "stable connection" (`e8 01 00 01`) drops to **SBC** — not AAC —
+and EQ and VPT then work immediately. Either switch briefly drops the audio link
+while the headset renegotiates.
+
+---
+
 ## System settings
 
 ```
-0xF8 0x03 0x00 <0|1>              wearing detection: 1 = on
 0xF8 0x04 0x01 <active> <select>  auto power off
 ```
 
@@ -260,8 +360,10 @@ in `select`.
 | After 30 min | `0x01` |
 | After 60 min | `0x02` |
 | After 180 min | `0x03` |
-| When removed | `0x10` |
 | Disabled | `0x11` |
+
+The table also defines "when removed" (`0x10`). The XM3 ignores it — it answers
+by reporting its existing timer — because it has no wearing sensor.
 
 ---
 
@@ -271,9 +373,11 @@ Present in the v1 table but not on this headset, or absent from v1 entirely:
 
 - **Speak-to-Chat** — XM4 and later.
 - **Multipoint** — XM4 (via firmware) and later. The XM3 holds one host link.
+- **Wearing detection** — no sensor; `CONTROL_BY_WEARING` never answers, and the
+  "power off when removed" timer is ignored.
 - **DSEE Extreme** — the XM3 has DSEE HX, the earlier algorithm.
-- **Adaptive Sound Control** — configured on the headset by the mobile app; not
-  exposed as a desktop-settable parameter here.
+- **Adaptive Sound Control** and **NC Optimizer** — the XM3 *does* support both
+  (support functions `0x71` and `0x81`), but this project does not drive them yet.
 - **Firmware updates** — the Sony Sound Connect mobile app remains the only way.
 
 ---

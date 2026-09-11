@@ -66,11 +66,10 @@ void print_usage(std::ostream& os) {
        << "                             vocal | treble | bass | speech | user1 | user2\n"
        << "  eq custom <b1..b5> <cb>    Five bands and Clear Bass, each -10..10\n"
        << "  dsee <on|off>              DSEE HX upscaling\n"
-       << "  ear-detect <on|off>        Pause playback when removed\n"
        << "  surround <preset>          off | outdoor | arena | concert | club\n"
        << "  sound-position <pos>       off | front-left | front-right | front |\n"
        << "                             rear-left | rear-right\n"
-       << "  auto-power-off <value>     off | 5min | 30min | 60min | 180min | on-remove\n"
+       << "  auto-power-off <value>     off | 5min | 30min | 60min | 180min\n"
        << "  connection <mode>          quality | stable\n\n"
        << "Options:\n"
        << "  -s, --socket <path>  Override socket path\n"
@@ -353,8 +352,7 @@ int main(int argc, char* argv[]) {
         return send_command(socket_path, "eq " + preset + "\n", false);
     }
 
-    if (subcmd == "voice-focus" || subcmd == "dsee" ||
-        subcmd == "ear-detect" || subcmd == "ear-detection") {
+    if (subcmd == "voice-focus" || subcmd == "dsee") {
         if (remaining.size() < 2) {
             std::cerr << "Error: '" << remaining[0] << "' requires 'on' or 'off'\n";
             return 1;
@@ -364,8 +362,7 @@ int main(int argc, char* argv[]) {
             std::cerr << "Error: '" << remaining[0] << "' requires 'on' or 'off'\n";
             return 1;
         }
-        std::string verb = (subcmd == "ear-detection") ? "ear-detect" : subcmd;
-        return send_command(socket_path, verb + " " + val + "\n", false);
+        return send_command(socket_path, subcmd + " " + val + "\n", false);
     }
 
     if (subcmd == "surround") {
@@ -393,12 +390,12 @@ int main(int argc, char* argv[]) {
 
     if (subcmd == "auto-power-off") {
         static const std::vector<std::string> valid = {
-            "off", "5min", "30min", "60min", "180min", "on-remove"
+            "off", "5min", "30min", "60min", "180min"
         };
         if (remaining.size() < 2 ||
             std::find(valid.begin(), valid.end(), to_lower(remaining[1])) == valid.end()) {
             std::cerr << "Error: 'auto-power-off' requires one of: off, 5min, 30min, 60min, "
-                         "180min, on-remove\n";
+                         "180min\n";
             return 1;
         }
         return send_command(socket_path, "auto-power-off " + to_lower(remaining[1]) + "\n", false);

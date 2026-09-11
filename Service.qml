@@ -37,7 +37,7 @@ Item {
   property var eqCustomBands: [0, 0, 0, 0, 0]
   property int clearBass: 0
   property string autoPowerOff: "unknown"
-  property string connectionMode: "unknown"
+  property string _realConnectionMode: "unknown"
 
   // Real internal states reported by daemon
   property string _realNoiseMode: Model.NOISE_UNKNOWN
@@ -45,7 +45,7 @@ Item {
   property bool _realVoicePassthrough: false
   property string _realEqPreset: Model.EQ_OFF
   property bool _realDseeHx: false
-  property bool _realEarDetection: true
+  property bool dseeHxActive: false
   property string _realSurround: Model.SURROUND_OFF
   property string _realSoundPosition: Model.SOUND_POSITION_OFF
 
@@ -55,7 +55,7 @@ Item {
   property var _desiredVoicePassthrough: null
   property string _desiredEqPreset: ""
   property var _desiredDsee: null
-  property var _desiredEarDetection: null
+  property string _desiredConnectionMode: ""
   property string _desiredSurround: ""
   property string _desiredSoundPosition: ""
 
@@ -65,9 +65,12 @@ Item {
   readonly property bool voicePassthrough: _desiredVoicePassthrough !== null ? _desiredVoicePassthrough : _realVoicePassthrough
   readonly property string eqPreset: _desiredEqPreset !== "" ? _desiredEqPreset : _realEqPreset
   readonly property bool dseeHx: _desiredDsee !== null ? _desiredDsee : _realDseeHx
-  readonly property bool earDetection: _desiredEarDetection !== null ? _desiredEarDetection : _realEarDetection
   readonly property string surround: _desiredSurround !== "" ? _desiredSurround : _realSurround
   readonly property string soundPosition: _desiredSoundPosition !== "" ? _desiredSoundPosition : _realSoundPosition
+  readonly property string connectionMode: _desiredConnectionMode !== "" ? _desiredConnectionMode : _realConnectionMode
+
+  // EQ and surround are unavailable while the headset streams LDAC.
+  readonly property bool dspAvailable: Model.dspAvailable(connectionMode)
 
   // Focus on Voice only exists in the upper part of the ambient range.
   readonly property bool voiceFocusAvailable: Model.isVoiceFocusAvailable(noiseMode, ambientSoundLevel)
@@ -77,7 +80,10 @@ Item {
     id: settleTimer
     interval: 4000
     repeat: false
-    onTriggered: root.clearOptimisticOverrides()
+    onTriggered: {
+      root.clearOptimisticOverrides()
+      interval = 4000
+    }
   }
 
   function clearOptimisticOverrides() {
@@ -86,7 +92,7 @@ Item {
     _desiredVoicePassthrough = null
     _desiredEqPreset = ""
     _desiredDsee = null
-    _desiredEarDetection = null
+    _desiredConnectionMode = ""
     _desiredSurround = ""
     _desiredSoundPosition = ""
   }
@@ -94,7 +100,7 @@ Item {
   function hasPendingOverrides() {
     return _desiredNoiseMode !== "" || _desiredAmbientLevel !== -1 ||
            _desiredVoicePassthrough !== null || _desiredEqPreset !== "" ||
-           _desiredDsee !== null || _desiredEarDetection !== null ||
+           _desiredDsee !== null || _desiredConnectionMode !== "" ||
            _desiredSurround !== "" || _desiredSoundPosition !== ""
   }
 
@@ -165,14 +171,14 @@ Item {
     eqCustomBands = parsed.eqCustomBands || [0, 0, 0, 0, 0]
     clearBass = parsed.clearBass !== undefined ? parsed.clearBass : 0
     autoPowerOff = parsed.autoPowerOff || "unknown"
-    connectionMode = parsed.connectionMode || "unknown"
+    _realConnectionMode = parsed.connectionMode || "unknown"
+    dseeHxActive = parsed.dseeHxActive === true
 
     _realNoiseMode = parsed.noiseMode || Model.NOISE_UNKNOWN
     _realAmbientSoundLevel = parsed.ambientSoundLevel !== undefined ? parsed.ambientSoundLevel : 0
     _realVoicePassthrough = parsed.voicePassthrough === true
     _realEqPreset = parsed.eqPreset || Model.EQ_OFF
     _realDseeHx = parsed.dseeHx === true
-    _realEarDetection = parsed.earDetection !== undefined ? parsed.earDetection : true
     _realSurround = parsed.surround || Model.SURROUND_OFF
     _realSoundPosition = parsed.soundPosition || Model.SOUND_POSITION_OFF
 
@@ -182,7 +188,7 @@ Item {
     if (_desiredVoicePassthrough !== null && _realVoicePassthrough === _desiredVoicePassthrough) _desiredVoicePassthrough = null
     if (_desiredEqPreset !== "" && _realEqPreset === _desiredEqPreset) _desiredEqPreset = ""
     if (_desiredDsee !== null && _realDseeHx === _desiredDsee) _desiredDsee = null
-    if (_desiredEarDetection !== null && _realEarDetection === _desiredEarDetection) _desiredEarDetection = null
+    if (_desiredConnectionMode !== "" && _realConnectionMode === _desiredConnectionMode) _desiredConnectionMode = ""
     if (_desiredSurround !== "" && _realSurround === _desiredSurround) _desiredSurround = ""
     if (_desiredSoundPosition !== "" && _realSoundPosition === _desiredSoundPosition) _desiredSoundPosition = ""
 
@@ -217,6 +223,7 @@ Item {
   }
 
   function setEqPreset(preset) {
+    if (!dspAvailable) return
     if (Model.EQ_PRESETS.indexOf(preset) === -1 && preset !== "user1" && preset !== "user2") return
     _desiredEqPreset = preset
     settleTimer.restart()
@@ -224,6 +231,7 @@ Item {
   }
 
   function setEqCustom(b1, b2, b3, b4, b5, cb) {
+    if (!dspAvailable) return
     _desiredEqPreset = Model.EQ_CUSTOM
     settleTimer.restart()
     runCommand([
@@ -243,13 +251,8 @@ Item {
     runCommand(["dsee", enabled ? "on" : "off"])
   }
 
-  function setEarDetect(enabled) {
-    _desiredEarDetection = enabled === true
-    settleTimer.restart()
-    runCommand(["ear-detect", enabled ? "on" : "off"])
-  }
-
   function setSurround(preset) {
+    if (!dspAvailable) return
     if (Model.SURROUND_PRESETS.indexOf(preset) === -1) return
     _desiredSurround = preset
     settleTimer.restart()
@@ -257,6 +260,7 @@ Item {
   }
 
   function setSoundPosition(position) {
+    if (!dspAvailable) return
     if (Model.SOUND_POSITIONS.indexOf(position) === -1) return
     _desiredSoundPosition = position
     settleTimer.restart()
@@ -270,6 +274,12 @@ Item {
 
   function setConnectionMode(mode) {
     if (Model.CONNECTION_MODES.indexOf(mode) === -1) return
+    if (mode === connectionMode) return
+    _desiredConnectionMode = mode
+    // The headset drops and re-establishes audio while it switches, so give
+    // the optimistic value longer than usual to be confirmed.
+    settleTimer.interval = 10000
+    settleTimer.restart()
     runCommand(["connection", mode])
   }
 

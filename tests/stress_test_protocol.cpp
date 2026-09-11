@@ -71,7 +71,7 @@ static std::vector<std::vector<uint8_t>> generateSampleValidFrames() {
 
     // Features
     frames.push_back(serializeDsee(true, 8));
-    frames.push_back(serializeEarDetection(true, 9));
+    frames.push_back(serializeQueryProtocolInfo(9));
     frames.push_back(serializeSurround(SurroundPreset::CONCERT_HALL, 10));
     frames.push_back(serializeSoundPosition(SoundPosition::REAR_RIGHT, 11));
     frames.push_back(serializeAutoPowerOff(AutoPowerOff::AFTER_30_MIN, 12));
@@ -84,7 +84,7 @@ static std::vector<std::vector<uint8_t>> generateSampleValidFrames() {
     frames.push_back(serializeQueryEq(17));
     frames.push_back(serializeQueryDsee(18));
     frames.push_back(serializeQueryCodec(19));
-    frames.push_back(serializeQueryEarDetection(20));
+    frames.push_back(serializeQuerySupportFunction(20));
 
     // Inbound-like responses (v1 command bytes)
     std::vector<uint8_t> batRet = {0x11, 0x00, 75, 0x01};

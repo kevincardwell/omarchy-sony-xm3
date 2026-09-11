@@ -12,9 +12,8 @@ Subcommands:
     dsee <on|off>
     surround <off|outdoor|arena|concert|club>
     sound-position <off|front-left|front-right|front|rear-left|rear-right>
-    auto-power-off <off|5min|30min|60min|180min|on-remove>
+    auto-power-off <off|5min|30min|60min|180min>
     connection <quality|stable>
-    ear-detect <on|off>
 
 Exit codes:
     0: Success
@@ -30,7 +29,7 @@ import argparse
 ENUM_SUBCOMMANDS = {
     "surround": ["off", "outdoor", "arena", "concert", "club"],
     "sound-position": ["off", "front-left", "front-right", "front", "rear-left", "rear-right"],
-    "auto-power-off": ["off", "5min", "30min", "60min", "180min", "on-remove"],
+    "auto-power-off": ["off", "5min", "30min", "60min", "180min"],
     "connection": ["quality", "stable"],
 }
 
@@ -82,7 +81,7 @@ def main():
 
     if args.help or not remaining:
         print("Usage: sony-xm3-ctl [-s <socket>] <subcommand> [args...]")
-        print("Subcommands: status, noise, ambient-level, eq, voice-focus, dsee, ear-detect,")
+        print("Subcommands: status, noise, ambient-level, eq, voice-focus, dsee,")
         print("             surround, sound-position, auto-power-off, connection")
         sys.exit(0 if args.help else 1)
 
@@ -175,13 +174,12 @@ def main():
             sys.stderr.write(f"Error from daemon: {resp}\n")
             sys.exit(1)
 
-    elif subcmd in ["voice-focus", "dsee", "ear-detect", "ear-detection"]:
+    elif subcmd in ["voice-focus", "dsee"]:
         if len(remaining) < 2 or remaining[1].lower() not in ["on", "off"]:
             sys.stderr.write(f"Error: '{subcmd}' requires 'on' or 'off'\n")
             sys.exit(1)
         val = remaining[1].lower()
-        cmd_verb = "ear-detect" if "ear" in subcmd else subcmd
-        code, resp = send_command(socket_path, f"{cmd_verb} {val}")
+        code, resp = send_command(socket_path, f"{subcmd} {val}")
         if code != 0:
             sys.exit(code)
         if resp.startswith("OK"):

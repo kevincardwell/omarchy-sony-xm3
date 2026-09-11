@@ -90,11 +90,12 @@ bool StateEngine::ensureStateDirectory(const std::filesystem::path& dirPath) {
 StateEngine::StateEngine(const std::filesystem::path& customStatePath)
     : stateFilePath_(resolveStateFilePath(customStatePath)),
       stateDir_(stateFilePath_.parent_path()) {
-    // Default initial WH-1000XM3 state; overwritten by the first real query.
+    // Placeholder state until the headset answers. Unknown values stay unknown:
+    // a plausible-looking default (it used to claim LDAC) is worse than blank.
     state_.schema_version = 1;
     state_.connected = true;
     state_.device_name = "WH-1000XM3";
-    state_.battery_level = 85;
+    state_.battery_level = -1;
     state_.battery_charging = false;
     state_.noise_mode = "anc";
     state_.ambient_sound_level = protocol::kStepNoiseCancel;
@@ -104,12 +105,12 @@ StateEngine::StateEngine(const std::filesystem::path& customStatePath)
     state_.eq_custom_bands = {0, 0, 0, 0, 0};
     state_.clear_bass = 0;
     state_.dsee_hx = false;
-    state_.ear_detection = true;
+    state_.dsee_hx_active = false;
     state_.surround = "off";
     state_.sound_position = "off";
     state_.auto_power_off = "unknown";
     state_.connection_mode = "unknown";
-    state_.codec = "LDAC";
+    state_.codec = "";
     state_.last_updated = nowSeconds();
 }
 
@@ -465,16 +466,6 @@ void StateEngine::setDsee(bool enabled) {
     {
         std::lock_guard<std::mutex> lock(mutex_);
         state_.dsee_hx = enabled;
-        touchAndPublishLocked(payloadJson);
-    }
-    writeAtomic(payloadJson);
-}
-
-void StateEngine::setEarDetection(bool enabled) {
-    std::string payloadJson;
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        state_.ear_detection = enabled;
         touchAndPublishLocked(payloadJson);
     }
     writeAtomic(payloadJson);

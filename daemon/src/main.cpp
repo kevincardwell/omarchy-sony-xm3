@@ -19,6 +19,7 @@
 #include "MDRProtocolV1.hpp"
 #include "StateEngine.hpp"
 #include "IpcServer.hpp"
+#include "CommandQueue.hpp"
 
 namespace {
 
@@ -92,6 +93,15 @@ std::optional<DaemonOptions> parseCommandLine(int argc, char* argv[]) {
         }
     }
     return opts;
+}
+
+// Sony headsets also advertise over Bluetooth LE as "LE_<model>", and BlueZ
+// lets that overwrite the classic name, so the same headset shows up as
+// "LE_WH-1000XM3" after a few reconnects. Show the product name.
+std::string displayName(const std::string& bluezName) {
+    std::string name = bluezName;
+    if (name.rfind("LE_", 0) == 0) name.erase(0, 3);
+    return name.empty() ? DEFAULT_DEVICE_NAME : name;
 }
 
 std::string resolveStateDir(const std::string& overrideDir) {
@@ -184,11 +194,10 @@ int main(int argc, char* argv[]) {
         stateEngine.updateNoiseMode("anc", 0, false);
         stateEngine.updateEqPreset("off");
         stateEngine.updateDsee(true);
-        stateEngine.updateEarDetection(true);
         stateEngine.setSurround("off");
         stateEngine.setSoundPosition("off");
         stateEngine.setAutoPowerOff("180min");
-        stateEngine.setConnectionMode("quality");
+        stateEngine.setConnectionMode("stable");
         stateEngine.save();
     }
 
@@ -216,12 +225,14 @@ int main(int argc, char* argv[]) {
     // Protocol stream framer
     StreamFramer streamFramer;
 
-    uint8_t txSeq = 0;
-    auto nextSeq = [&]() -> uint8_t {
-        uint8_t s = txSeq;
-        txSeq ^= 1;
-        return s;
-    };
+    // SONY_XM3_DEBUG=1 logs every raw byte received, before framing.
+    const char* debugEnv = std::getenv("SONY_XM3_DEBUG");
+    const bool verboseMdr = debugEnv && debugEnv[0] == '1';
+
+    CommandQueue commands([&](const std::vector<uint8_t>& frame) {
+        btManager->sendPacket(frame);
+    });
+    commands.setLogging(true);
 
     // Remembers the last true ambient step so that switching ANC -> Ambient
     // returns to where the user left the slider rather than to a default.
@@ -233,7 +244,7 @@ int main(int argc, char* argv[]) {
 
     auto send = [&](const std::vector<uint8_t>& packet, const char* what) {
         if (connected()) {
-            btManager->sendPacket(packet);
+            commands.enqueue(packet, what);
         } else {
             fprintf(stderr, "[DAEMON] Not connected; dropped %s\n", what);
             fflush(stderr);
@@ -242,9 +253,9 @@ int main(int argc, char* argv[]) {
 
     BluetoothCallbacks callbacks;
     callbacks.onConnected = [&]() {
-        txSeq = 0;
+        commands.reset();
         const auto& dev = btManager->getCurrentDevice();
-        std::string name = dev.name.empty() ? DEFAULT_DEVICE_NAME : dev.name;
+        std::string name = displayName(dev.name);
         stateEngine.setConnected(true, name);
         if (dev.batteryLevel >= 0) {
             stateEngine.setBattery(dev.batteryLevel, false);
@@ -255,23 +266,26 @@ int main(int argc, char* argv[]) {
         fflush(stderr);
 
         if (!opts.mockMode) {
-            // Initial status query flurry with sequence toggling
-            btManager->sendPacket(serializeQueryNcAsmCapability(nextSeq()));
-            btManager->sendPacket(serializeQueryBattery(nextSeq()));
-            btManager->sendPacket(serializeQueryNoiseMode(nextSeq()));
-            btManager->sendPacket(serializeQueryEq(nextSeq()));
-            btManager->sendPacket(serializeQueryCodec(nextSeq()));
-            btManager->sendPacket(serializeQueryDsee(nextSeq()));
-            btManager->sendPacket(serializeQueryEarDetection(nextSeq()));
-            btManager->sendPacket(serializeQuerySurround(nextSeq()));
-            btManager->sendPacket(serializeQuerySoundPosition(nextSeq()));
-            btManager->sendPacket(serializeQueryAutoPowerOff(nextSeq()));
-            btManager->sendPacket(serializeQueryConnectionMode(nextSeq()));
+            // Handshake first: the headset ignores parameter queries until it
+            // has seen these. Then the state queries, one ACK at a time.
+            send(serializeQueryProtocolInfo(), "handshake protocol info");
+            send(serializeQueryCapabilityInfo(), "handshake capability info");
+            send(serializeQuerySupportFunction(), "handshake support function");
+            send(serializeQueryNcAsmCapability(), "query nc/asm capability");
+            send(serializeQueryBattery(), "query battery");
+            send(serializeQueryNoiseMode(), "query noise mode");
+            send(serializeQueryEq(), "query eq");
+            send(serializeQueryCodec(), "query codec");
+            send(serializeQueryDsee(), "query dsee hx");
+            send(serializeQuerySurround(), "query surround");
+            send(serializeQuerySoundPosition(), "query sound position");
+            send(serializeQueryAutoPowerOff(), "query auto power off");
+            send(serializeQueryConnectionMode(), "query connection mode");
         }
     };
 
     callbacks.onDisconnected = [&](const std::string& reason) {
-        txSeq = 0;
+        commands.reset();
         streamFramer.reset();
         stateEngine.setConnected(false);
         stateEngine.save();
@@ -280,12 +294,33 @@ int main(int argc, char* argv[]) {
     };
 
     callbacks.onDataReceived = [&](const uint8_t* data, size_t length) {
+        if (verboseMdr) {
+            fprintf(stderr, "[MDR] RX raw %zu bytes:", length);
+            for (size_t i = 0; i < length; ++i) fprintf(stderr, " %02x", data[i]);
+            fprintf(stderr, "\n");
+        }
         streamFramer.append(std::span<const uint8_t>(data, length));
         while (auto frameOpt = streamFramer.nextFrame()) {
             auto unpackedOpt = unpackFrame(*frameOpt);
-            if (!unpackedOpt) continue;
+            if (!unpackedOpt) {
+                fprintf(stderr, "[MDR] RX undecodable frame (%zu bytes):", frameOpt->size());
+                for (uint8_t b : *frameOpt) fprintf(stderr, " %02x", b);
+                fprintf(stderr, "\n");
+                fflush(stderr);
+                continue;
+            }
 
             const auto& unpacked = *unpackedOpt;
+            if (unpacked.type == PacketType::ACK) {
+                // Logged before onFrame(): the ACK releases the next command,
+                // and its TX line should read as a consequence, not a cause.
+                fprintf(stderr, "[MDR] RX ACK seq=%u\n", static_cast<unsigned>(unpacked.seq));
+                fflush(stderr);
+            }
+            commands.onFrame(unpacked.type, unpacked.seq);
+            if (unpacked.type == PacketType::ACK) {
+                continue;
+            }
             if (unpacked.type == PacketType::DATA_MDR || unpacked.type == PacketType::DATA_MDR_NO2) {
                 // Reply with ACK packet
                 auto ack = serializeACK(unpacked.seq);
@@ -354,9 +389,9 @@ int main(int argc, char* argv[]) {
         fflush(stderr);
 
         if (mode == NoiseMode::OFF) {
-            send(serializeNcAsm(false, step, false, nextSeq()), "noise off");
+            send(serializeNcAsm(false, step, false), "noise off");
         } else {
-            send(serializeNcAsm(true, step, voiceFocus, nextSeq()), "noise mode");
+            send(serializeNcAsm(true, step, voiceFocus), "noise mode");
         }
         return true;
     };
@@ -369,7 +404,7 @@ int main(int argc, char* argv[]) {
         stateEngine.save();
         fprintf(stderr, "[DAEMON] Ambient step: %u\n", (unsigned)level);
         fflush(stderr);
-        send(serializeAmbientLevel(level, voiceFocus, nextSeq()), "ambient level");
+        send(serializeAmbientLevel(level, voiceFocus), "ambient level");
         return true;
     };
     ipcCb.setVoiceFocus = [&](bool enabled, std::string& /*err*/) {
@@ -380,61 +415,72 @@ int main(int argc, char* argv[]) {
         // current step rather than inventing a separate message for it.
         const uint8_t step = static_cast<uint8_t>(snapshot.ambient_sound_level);
         const bool noiseOn = snapshot.noise_mode != "off";
-        send(serializeNcAsm(noiseOn, step, enabled, nextSeq()), "focus on voice");
+        send(serializeNcAsm(noiseOn, step, enabled), "focus on voice");
         return true;
     };
-    ipcCb.setEqPreset = [&](EqPreset preset, std::string& /*err*/) {
+    // On "Priority on sound quality" (LDAC) the XM3 cannot run its EQ or VPT
+    // processing. A command sent anyway is answered with a "this will change
+    // the connection mode — proceed?" alert rather than applied, so refuse it
+    // up front and say why.
+    auto dspBlockedByLdac = [&](const char* feature, std::string& err) {
+        if (stateEngine.getState().connection_mode != "quality") return false;
+        err = std::string(feature) +
+              " is unavailable on Priority on sound quality (LDAC); "
+              "use `sony-xm3-ctl connection stable` to trade LDAC for it";
+        return true;
+    };
+
+    ipcCb.setEqPreset = [&](EqPreset preset, std::string& err) {
+        if (dspBlockedByLdac("EQ", err)) return false;
         stateEngine.updateEqPreset(eqPresetToString(preset));
         stateEngine.save();
-        send(serializeEqPreset(preset, nextSeq()), "eq preset");
+        send(serializeEqPreset(preset), "eq preset");
         return true;
     };
-    ipcCb.setCustomEq = [&](const std::array<int, 5>& bands, int clearBass, std::string& /*err*/) {
+    ipcCb.setCustomEq = [&](const std::array<int, 5>& bands, int clearBass, std::string& err) {
+        if (dspBlockedByLdac("EQ", err)) return false;
         stateEngine.updateCustomEq(bands, clearBass);
         stateEngine.save();
-        send(serializeCustomEq(bands, clearBass, nextSeq()), "custom eq");
+        send(serializeCustomEq(bands, clearBass), "custom eq");
         return true;
     };
     ipcCb.setDsee = [&](bool enabled, std::string& /*err*/) {
         stateEngine.updateDsee(enabled);
         stateEngine.save();
-        send(serializeDsee(enabled, nextSeq()), "dsee hx");
+        send(serializeDsee(enabled), "dsee hx");
         return true;
     };
-    ipcCb.setEarDetection = [&](bool enabled, std::string& /*err*/) {
-        stateEngine.updateEarDetection(enabled);
-        stateEngine.save();
-        send(serializeEarDetection(enabled, nextSeq()), "ear detection");
-        return true;
-    };
-    ipcCb.setSurround = [&](SurroundPreset preset, std::string& /*err*/) {
+    ipcCb.setSurround = [&](SurroundPreset preset, std::string& err) {
+        if (dspBlockedByLdac("Surround", err)) return false;
         stateEngine.setSurround(surroundToString(preset));
         stateEngine.save();
-        send(serializeSurround(preset, nextSeq()), "surround");
+        send(serializeSurround(preset), "surround");
         return true;
     };
-    ipcCb.setSoundPosition = [&](SoundPosition position, std::string& /*err*/) {
+    ipcCb.setSoundPosition = [&](SoundPosition position, std::string& err) {
+        if (dspBlockedByLdac("Sound position", err)) return false;
         stateEngine.setSoundPosition(soundPositionToString(position));
         stateEngine.save();
-        send(serializeSoundPosition(position, nextSeq()), "sound position");
+        send(serializeSoundPosition(position), "sound position");
         return true;
     };
     ipcCb.setAutoPowerOff = [&](AutoPowerOff timer, std::string& /*err*/) {
         stateEngine.setAutoPowerOff(autoPowerOffToString(timer));
         stateEngine.save();
-        send(serializeAutoPowerOff(timer, nextSeq()), "auto power off");
+        send(serializeAutoPowerOff(timer), "auto power off");
         return true;
     };
     ipcCb.setConnectionMode = [&](ConnectionMode mode, std::string& /*err*/) {
         stateEngine.setConnectionMode(connectionModeToString(mode));
         stateEngine.save();
-        send(serializeConnectionMode(mode, nextSeq()), "connection mode");
+        send(serializeConnectionMode(mode), "connection mode");
+        send(serializeQueryEq(), "re-query eq after mode change");
+        send(serializeQuerySurround(), "re-query surround after mode change");
+        send(serializeQuerySoundPosition(), "re-query sound position after mode change");
         return true;
     };
     ipcCb.sendPacket = [&](const std::vector<uint8_t>& packet) {
-        if (connected()) {
-            btManager->sendPacket(packet);
-        }
+        send(packet, "raw packet");
         return true;
     };
     ipcCb.onTestSetBattery = [&](int level, bool charging) {
@@ -539,6 +585,7 @@ int main(int argc, char* argv[]) {
 
         // Subsystem periodic tick (timeouts and reconnect backoff)
         btManager->tick();
+        commands.tick();
     }
 
     // 8. Graceful Shutdown & Resource Cleanup
