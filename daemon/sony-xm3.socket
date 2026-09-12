@@ -1,0 +1,15 @@
+[Unit]
+Description=Sony WH-1000XM3 daemon control socket
+
+[Socket]
+# The user's own service manager creates this socket at login and holds it for
+# the whole session, including across daemon restarts. The name is therefore
+# never unbound while you are logged in, so nothing else can take it and answer
+# in the daemon's place, and the daemon inherits the listening descriptor
+# instead of binding the path itself.
+ListenStream=%t/sony-xm3.sock
+SocketMode=0600
+RemoveOnStop=true
+
+[Install]
+WantedBy=sockets.target

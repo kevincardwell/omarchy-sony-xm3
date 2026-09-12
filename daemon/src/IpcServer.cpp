@@ -139,6 +139,50 @@ IpcServer& IpcServer::operator=(IpcServer&& other) noexcept {
     return *this;
 }
 
+// Socket activation: systemd's user manager creates and holds the listening
+// socket for the whole session, so the name is bound from login to logout and
+// there is no window during a daemon restart in which another process could
+// bind it and answer in the daemon's place. The descriptor arrives as fd 3.
+int IpcServer::takeSystemdListenFd() {
+    const char* pidEnv = ::getenv("LISTEN_PID");
+    const char* fdsEnv = ::getenv("LISTEN_FDS");
+    // Consumed once: a descriptor must never be adopted twice.
+    ::unsetenv("LISTEN_PID");
+    ::unsetenv("LISTEN_FDS");
+    ::unsetenv("LISTEN_FDNAMES");
+
+    if (pidEnv == nullptr || fdsEnv == nullptr) {
+        return -1;
+    }
+    errno = 0;
+    const long pid = std::strtol(pidEnv, nullptr, 10);
+    const long count = std::strtol(fdsEnv, nullptr, 10);
+    if (errno != 0 || pid != static_cast<long>(::getpid()) || count < 1) {
+        return -1;
+    }
+
+    constexpr int kListenFdsStart = 3;
+    const int fd = kListenFdsStart;
+
+    // It must really be a listening AF_UNIX stream socket.
+    int value = 0;
+    socklen_t len = sizeof(value);
+    if (::getsockopt(fd, SOL_SOCKET, SO_ACCEPTCONN, &value, &len) != 0 || value != 1) {
+        return -1;
+    }
+    len = sizeof(value);
+    if (::getsockopt(fd, SOL_SOCKET, SO_DOMAIN, &value, &len) != 0 || value != AF_UNIX) {
+        return -1;
+    }
+
+    const int flags = ::fcntl(fd, F_GETFL, 0);
+    if (flags < 0 || ::fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+        return -1;
+    }
+    ::fcntl(fd, F_SETFD, FD_CLOEXEC);
+    return fd;
+}
+
 bool IpcServer::start() {
     if (running_) {
         return true;
@@ -146,6 +190,24 @@ bool IpcServer::start() {
 
     if (actualSocketPath_.empty()) {
         actualSocketPath_ = resolveSocketPath(socketPathConfig_);
+    }
+
+    // Prefer the listener the service manager already holds.
+    if (socketPathConfig_.empty()) {
+        const int inherited = takeSystemdListenFd();
+        if (inherited >= 0) {
+            listenFd_ = inherited;
+            socketActivated_ = true;
+            running_ = true;
+
+            struct sockaddr_un bound{};
+            socklen_t boundLen = sizeof(bound);
+            if (::getsockname(listenFd_, reinterpret_cast<struct sockaddr*>(&bound), &boundLen) == 0 &&
+                bound.sun_family == AF_UNIX && bound.sun_path[0] != '\0') {
+                actualSocketPath_ = bound.sun_path;
+            }
+            return true;
+        }
     }
 
     // 1. Ensure parent directory exists with mode 0700
@@ -220,9 +282,13 @@ void IpcServer::stop() {
         listenFd_ = -1;
     }
 
-    if (!actualSocketPath_.empty()) {
+    // A socket the service manager owns must survive this process: removing it
+    // would unbind the name and leave a window in which another process could
+    // take it and answer in the daemon's place.
+    if (!actualSocketPath_.empty() && !socketActivated_) {
         ::unlink(actualSocketPath_.c_str());
     }
+    socketActivated_ = false;
 
     running_ = false;
 }

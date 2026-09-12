@@ -13,9 +13,15 @@
 //     (/run/user/<uid>), which the kernel creates and only this user may
 //     enter. Anything else, including an unset or relative XDG_RUNTIME_DIR,
 //     is refused rather than fallen back on.
-//   - Everything read is bounded: a line longer than maxLineBytes, or a
-//     daemon that stops answering within responseTimeoutMs, drops the
-//     connection instead of growing the shell's memory or holding the queue.
+//   - Everything read is bounded before it is buffered. The parser hands over
+//     raw chunks (an empty splitMarker), and each chunk is counted against
+//     maxRxBytes before anything is appended or searched for a delimiter, so a
+//     peer that never sends a newline cannot grow the shell's memory. A daemon
+//     that stops answering within responseTimeoutMs is dropped as well.
+//   - The peer is treated as untrusted input regardless. The socket lives in a
+//     directory only this user can enter, and the service manager holds the
+//     listening socket for the whole session (sony-xm3.socket), so the name is
+//     never unbound between daemon restarts.
 pragma ComponentBehavior: Bound
 
 import QtQuick
@@ -43,7 +49,7 @@ Item {
   readonly property bool socketPathTrusted: runtimeDir !== ""
   readonly property string socketPath: socketPathTrusted ? runtimeDir + "/sony-xm3.sock" : ""
 
-  readonly property int maxLineBytes: 65536      // a status line is well under 4 KiB
+  readonly property int maxRxBytes: 65536        // a status line is well under 4 KiB
   readonly property int maxCommandBytes: 512
   readonly property int maxOutstanding: 32
   readonly property int responseTimeoutMs: 5000
@@ -51,6 +57,7 @@ Item {
 
   property int _outstanding: 0
   property int _backoffMs: 1000
+  property string _rx: ""            // bytes received since the last newline
 
   // ---------------------------------------------------------------------------
   // State
@@ -151,9 +158,12 @@ Item {
       path: root.socketPath
       connected: true
 
+      // An empty split marker delivers each chunk as it arrives instead of
+      // buffering until a delimiter, which lets the byte limit be enforced
+      // before anything is accumulated here.
       parser: SplitParser {
-        splitMarker: "\n"
-        onRead: function(data) { root._onLine(data) }
+        splitMarker: ""
+        onRead: function(data) { root._onChunk(data) }
       }
 
       // The socket connects while the Loader is still constructing it, so the
@@ -184,6 +194,7 @@ Item {
 
   function _onLinkState(sock) {
     if (sock && sock.connected) {
+      root._rx = ""
       root._outstanding = 0
       root._backoffMs = 1000
       root.lastError = ""
@@ -200,6 +211,7 @@ Item {
   function _onLinkLost(reason) {
     deadline.stop()
     handshake.stop()
+    root._rx = ""
     root._outstanding = 0
     root._offline(reason)
     root._scheduleReconnect()
@@ -264,13 +276,28 @@ Item {
     root._pending = ({})
   }
 
-  function _onLine(data) {
-    var line = String(data)
-    if (line.length > root.maxLineBytes) {
+  // Raw bytes, straight off the socket. The limit covers the new chunk plus
+  // whatever is already held, and is applied before the append and before any
+  // search for a newline, so an endless line is cut off at maxRxBytes rather
+  // than buffered.
+  function _onChunk(data) {
+    var chunk = String(data)
+    if (root._rx.length + chunk.length > root.maxRxBytes) {
       root._giveUp("The Sony daemon sent an oversized reply")
       return
     }
-    line = line.trim()
+    root._rx += chunk
+
+    var cut
+    while ((cut = root._rx.indexOf("\n")) !== -1) {
+      var line = root._rx.substring(0, cut)
+      root._rx = root._rx.substring(cut + 1)
+      root._onLine(line)
+    }
+  }
+
+  function _onLine(data) {
+    var line = String(data).trim()
     if (!line) return
 
     if (line.charAt(0) === "{") {

@@ -1160,6 +1160,74 @@ void testIpcSubscribeAndBroadcast() {
     TEST_PASS("IpcServer subscribe/broadcast");
 }
 
+// Socket activation: the service manager holds the listening socket for the
+// session, so the daemon must adopt the descriptor it is handed instead of
+// binding the path itself.
+void testIpcSocketActivation() {
+    TEST_CASE("IpcServer socket activation");
+
+    char tmpl[] = "/tmp/test_omasonyxm3_act_XXXXXX";
+    char* sandbox = ::mkdtemp(tmpl);
+    TEST_ASSERT(sandbox != nullptr, "mkdtemp for activation test must succeed");
+    const std::string sockPath = std::string(sandbox) + "/activated.sock";
+
+    // Stand in for systemd: bind and listen here, then hand fd 3 over.
+    int bound = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    TEST_ASSERT(bound >= 0, "listener creation must succeed");
+    struct sockaddr_un addr{};
+    addr.sun_family = AF_UNIX;
+    std::strncpy(addr.sun_path, sockPath.c_str(), sizeof(addr.sun_path) - 1);
+    TEST_ASSERT_EQ(::bind(bound, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)), 0, "bind must succeed");
+    TEST_ASSERT_EQ(::listen(bound, 8), 0, "listen must succeed");
+
+    constexpr int kListenFdsStart = 3;
+    if (bound != kListenFdsStart) {
+        TEST_ASSERT(::dup2(bound, kListenFdsStart) == kListenFdsStart, "handover to fd 3 must succeed");
+        ::close(bound);
+    }
+    ::setenv("LISTEN_PID", std::to_string(::getpid()).c_str(), 1);
+    ::setenv("LISTEN_FDS", "1", 1);
+
+    {
+        IpcServer server;
+        TEST_ASSERT(server.start(), "start must succeed with an inherited socket");
+        TEST_ASSERT(server.isSocketActivated(), "the inherited descriptor must be adopted");
+        TEST_ASSERT_EQ(server.getSocketPath(), sockPath, "the adopted socket keeps its bound path");
+        TEST_ASSERT_EQ(server.getListenFd(), kListenFdsStart, "the passed descriptor is used as-is");
+        TEST_ASSERT(::getenv("LISTEN_FDS") == nullptr, "LISTEN_FDS is consumed, never inherited twice");
+
+        // A client reaches the adopted listener.
+        int clientFd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+        TEST_ASSERT_EQ(::connect(clientFd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)), 0,
+                       "connect to the adopted socket must succeed");
+        server.pollOnce(50);
+        TEST_ASSERT_EQ(server.getClientCount(), 1UL, "the adopted listener accepts clients");
+        ::close(clientFd);
+        server.stop();
+
+        // Stopping must leave the manager's socket bound: unlinking it would
+        // open exactly the window socket activation exists to close.
+        struct stat st{};
+        TEST_ASSERT_EQ(::stat(sockPath.c_str(), &st), 0, "an adopted socket is left in place on stop");
+    }
+
+    // Without the environment, the daemon binds for itself as before.
+    {
+        const std::string ownPath = std::string(sandbox) + "/own.sock";
+        IpcServer server(ownPath);
+        TEST_ASSERT(server.start(), "start must succeed without socket activation");
+        TEST_ASSERT(!server.isSocketActivated(), "a self-bound socket is not reported as activated");
+        server.stop();
+
+        struct stat st{};
+        TEST_ASSERT(::stat(ownPath.c_str(), &st) != 0, "a self-bound socket is cleaned up on stop");
+    }
+
+    ::unlink(sockPath.c_str());
+    ::rmdir(sandbox);
+    TEST_PASS("IpcServer socket activation");
+}
+
 void testCommandQueue() {
     TEST_CASE("CommandQueue");
 
@@ -1365,6 +1433,7 @@ int main() {
     testStateEngine();
     testIpcServer();
     testIpcSubscribeAndBroadcast();
+    testIpcSocketActivation();
     testCommandQueue();
     testDeviceFeatures();
 

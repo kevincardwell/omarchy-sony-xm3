@@ -125,14 +125,27 @@ The widget lives inside the long-lived shell process, so it keeps that side as
 narrow as it can: it starts no processes, resolves nothing through `PATH` and
 opens no files. It connects to the daemon's socket in this login session's
 runtime directory (`/run/user/<uid>`), refusing any other path, sends
-`subscribe`, and is then pushed every state change. Replies are bounded, and a
-daemon that stops answering within five seconds is dropped and retried with a
-backoff rather than left holding the queue.
+`subscribe`, and is then pushed every state change.
+
+The socket itself belongs to your systemd user manager, not to the daemon:
+`sony-xm3.socket` creates it at login and holds it until logout, and the daemon
+inherits the listening descriptor instead of binding the path. The name is
+therefore never unbound while you are logged in, including while the daemon
+restarts, so nothing can take it and answer in the daemon's place — and a
+connection that arrives while the daemon is stopped starts it.
+
+Whatever is on the other end is still treated as untrusted. The parser hands
+the plugin raw chunks and each one is counted against a 64 KiB budget before it
+is buffered or searched for a newline, so a peer that never sends one cannot
+grow the shell's memory. At most 32 commands may be in flight, each is length
+checked, and a daemon that does not answer within five seconds is dropped and
+retried with a backoff.
 
 - **Plugin** (`Panel.qml`, `Service.qml`, `Model.js`, `SonyIcon.qml`) — Quickshell/QML, Omarchy manifest schema 1.
 - **`daemon/`** — C++20 daemon owning the RFCOMM link and the UNIX socket.
 - **`cli/`** — `sony-xm3-ctl`, a thin client for the same socket.
 - **`installer/`** — `sony-xm3-deploy`, the helper `setup` uses to place and remove files without following symlinks (built, never installed).
+- **`daemon/sony-xm3.socket`** — the systemd user socket that owns the control socket for the session; `daemon/sony-xm3.service` pulls it in.
 
 ---
 

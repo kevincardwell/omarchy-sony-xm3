@@ -398,8 +398,13 @@ int main(int argc, char* argv[]) {
     btManager->start();
 
     // 5. Initialize UNIX Domain Socket IPC Server
+    //
+    // With no explicit --runtime-dir the server resolves its own path, which
+    // also lets it adopt the listening socket systemd holds for the session
+    // (sony-xm3.socket) rather than binding the path itself. An explicit
+    // override always binds, so tests and manual runs stay predictable.
     std::string socketPath = runtimeDir + "/sony-xm3.sock";
-    IpcServer ipcServer(socketPath);
+    IpcServer ipcServer(opts.runtimeDir.empty() ? std::string() : socketPath);
 
     IpcCallbacks ipcCb;
     ipcCb.getStatusJson = [&]() {

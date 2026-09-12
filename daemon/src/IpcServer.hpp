@@ -74,6 +74,16 @@ public:
     // Path resolution utility
     [[nodiscard]] static std::string resolveSocketPath(const std::string& overridePath = "");
 
+    // Adopts the listening socket systemd passed in (LISTEN_FDS), if any.
+    // Returns the descriptor, or -1 when the daemon was not socket-activated.
+    // The environment variables are cleared either way, so a descriptor is
+    // adopted at most once.
+    [[nodiscard]] static int takeSystemdListenFd();
+
+    // True when the listening socket came from the service manager rather than
+    // from bind() in this process.
+    [[nodiscard]] bool isSocketActivated() const noexcept { return socketActivated_; }
+
     // Lifecycle
     bool start();
     void stop();
@@ -121,6 +131,7 @@ private:
     std::string actualSocketPath_;
     int listenFd_{-1};
     bool running_{false};
+    bool socketActivated_{false};
     uint8_t seq_{0};
     size_t maxLineLength_{4096};
     size_t maxOutBuffer_{262144};

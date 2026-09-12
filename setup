@@ -126,8 +126,10 @@ Steps performed:
   2. Configure and build daemon, CLI and installer helper with CMake and Ninja
      in build-setup/.
   3. Install sony-xm3-daemon and sony-xm3-ctl into ~/.local/bin (mode 0755).
-  4. Install daemon/sony-xm3.service into ~/.config/systemd/user/, then enable
-     and (re)start it.
+  4. Install daemon/sony-xm3.socket and daemon/sony-xm3.service into
+     ~/.config/systemd/user/, then enable and (re)start them. The socket unit
+     holds the control socket for the whole session, so the daemon inherits it
+     instead of binding the path itself.
   5. Deploy the plugin to ~/.config/omarchy/plugins/io.github.kevincardwell.omasonyxm3,
      validate it, enable it next to the volume control, and restart the shell.
      If this checkout already is that directory (installed with
@@ -286,15 +288,20 @@ install_binaries() {
 }
 
 install_systemd_service() {
-  info "Installing systemd user service..."
-  "$DEPLOY" put .config/systemd/user 0644 "$ROOT_DIR/daemon/sony-xm3.service"
+  info "Installing systemd user socket and service..."
+  "$DEPLOY" put .config/systemd/user 0644 \
+    "$ROOT_DIR/daemon/sony-xm3.socket" \
+    "$ROOT_DIR/daemon/sony-xm3.service"
 
   "$SYSTEMCTL" --user daemon-reload 2>/dev/null || true
+  # The socket unit owns the listening socket for the whole session, so it goes
+  # up first and stays up while the daemon restarts.
+  "$SYSTEMCTL" --user enable --now sony-xm3.socket 2>/dev/null || true
   # enable --now starts it immediately; restart covers re-running setup over an
   # existing install, which would otherwise keep running the old binary.
   "$SYSTEMCTL" --user enable --now sony-xm3.service 2>/dev/null || true
   "$SYSTEMCTL" --user restart sony-xm3.service 2>/dev/null || true
-  success "sony-xm3.service installed, enabled and running."
+  success "sony-xm3.socket and sony-xm3.service installed, enabled and running."
 }
 
 deploy_plugin() {
@@ -378,9 +385,10 @@ uninstall() {
   ensure_deploy_helper
 
   "$SYSTEMCTL" --user disable --now sony-xm3.service 2>/dev/null || true
-  "$DEPLOY" remove .config/systemd/user sony-xm3.service
+  "$SYSTEMCTL" --user disable --now sony-xm3.socket 2>/dev/null || true
+  "$DEPLOY" remove .config/systemd/user sony-xm3.service sony-xm3.socket
   "$SYSTEMCTL" --user daemon-reload 2>/dev/null || true
-  success "sony-xm3.service stopped and removed."
+  success "sony-xm3.socket and sony-xm3.service stopped and removed."
 
   "$DEPLOY" remove .local/bin sony-xm3-daemon sony-xm3-ctl
   success "Binaries removed from $HOME/.local/bin/."
