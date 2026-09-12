@@ -22,6 +22,8 @@ struct ClientSession {
     std::string inBuffer;
     std::string outBuffer;
     std::chrono::steady_clock::time_point connectedAt;
+    // Set by the `subscribe` command: the session is sent every status change.
+    bool subscribed{false};
 };
 
 // Delegate callbacks for decoupling IpcServer from StateEngine and BluetoothManager
@@ -86,6 +88,12 @@ public:
     [[nodiscard]] int getListenFd() const noexcept { return listenFd_; }
     [[nodiscard]] size_t getClientCount() const noexcept { return clients_.size(); }
 
+    // Sends one status line to every subscribed client. A client that cannot
+    // keep up (its queue passes maxOutBuffer_) is dropped rather than allowed
+    // to grow the daemon's memory.
+    void broadcastStatus(const std::string& statusJson);
+    [[nodiscard]] size_t getSubscriberCount() const noexcept;
+
     // Command parser (public for unit testing without sockets)
     [[nodiscard]] std::string handleCommandLine(const std::string& line);
     [[nodiscard]] std::string handleBuiltinCommand(const std::string& line);
@@ -115,6 +123,7 @@ private:
     bool running_{false};
     uint8_t seq_{0};
     size_t maxLineLength_{4096};
+    size_t maxOutBuffer_{262144};
 
     CommandHandler customHandler_;
     IpcCallbacks callbacks_;

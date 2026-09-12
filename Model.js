@@ -109,13 +109,13 @@ function oneOf(list, value, fallback) {
 function parseStatus(raw) {
   if (raw === null || raw === undefined) {
     var res = defaultStatus();
-    res.lastError = "The sony status file is empty";
+    res.lastError = "The sony daemon sent no status";
     return res;
   }
   var text = String(raw).trim();
   if (!text) {
     var res = defaultStatus();
-    res.lastError = "The sony status file is empty";
+    res.lastError = "The sony daemon sent no status";
     return res;
   }
 
@@ -124,19 +124,19 @@ function parseStatus(raw) {
     parsed = JSON.parse(text);
   } catch (_e) {
     var res = defaultStatus();
-    res.lastError = "Could not read the sony status file";
+    res.lastError = "Could not read the sony status";
     return res;
   }
 
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
     var res = defaultStatus();
-    res.lastError = "The sony status file is invalid";
+    res.lastError = "The sony status is invalid";
     return res;
   }
 
   if (parsed.schema_version === undefined || parsed.schema_version === null) {
     var res = defaultStatus();
-    res.lastError = "The sony status file carried no schema_version";
+    res.lastError = "The sony status carried no schema_version";
     return res;
   }
 

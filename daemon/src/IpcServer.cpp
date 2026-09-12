@@ -280,7 +280,21 @@ void IpcServer::handleClientRead(int clientFd) {
                 std::string line = session.inBuffer.substr(0, pos);
                 session.inBuffer.erase(0, pos + 1);
 
-                std::string response = handleCommandLine(line);
+                // `subscribe` needs the session, so it is handled here rather
+                // than in the session-independent command parser.
+                std::string response;
+                if (trim(line) == "subscribe") {
+                    session.subscribed = true;
+                    response = callbacks_.getStatusJson ? callbacks_.getStatusJson() : std::string("{}");
+                    if (response.empty() || response.back() != '\n') {
+                        response += "\n";
+                    }
+                } else if (trim(line) == "unsubscribe") {
+                    session.subscribed = false;
+                    response = "OK\n";
+                } else {
+                    response = handleCommandLine(line);
+                }
                 if (!queueResponse(session, response)) {
                     closeClient(clientFd);
                     return;
@@ -334,6 +348,41 @@ void IpcServer::handleClientWrite(int clientFd) {
 bool IpcServer::queueResponse(ClientSession& session, const std::string& response) {
     session.outBuffer.append(response);
     return flushClientOutBuffer(session);
+}
+
+void IpcServer::broadcastStatus(const std::string& statusJson) {
+    std::string line = statusJson;
+    if (line.empty() || line.back() != '\n') {
+        line += "\n";
+    }
+
+    std::vector<int> stalled;
+    for (auto& [fd, session] : clients_) {
+        if (!session.subscribed) {
+            continue;
+        }
+        // A reader that never drains would otherwise queue without bound.
+        if (session.outBuffer.size() + line.size() > maxOutBuffer_) {
+            stalled.push_back(fd);
+            continue;
+        }
+        if (!queueResponse(session, line)) {
+            stalled.push_back(fd);
+        }
+    }
+    for (int fd : stalled) {
+        closeClient(fd);
+    }
+}
+
+size_t IpcServer::getSubscriberCount() const noexcept {
+    size_t count = 0;
+    for (const auto& [fd, session] : clients_) {
+        if (session.subscribed) {
+            ++count;
+        }
+    }
+    return count;
 }
 
 void IpcServer::closeClient(int clientFd) {

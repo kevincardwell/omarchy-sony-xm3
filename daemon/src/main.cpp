@@ -596,6 +596,7 @@ int main(int argc, char* argv[]) {
 
     // 7. Unified Event Loop
     bool running = true;
+    std::string lastPublishedStatus;
 
     while (running) {
         std::vector<struct pollfd> pfds;
@@ -667,6 +668,17 @@ int main(int argc, char* argv[]) {
         // Subsystem periodic tick (timeouts and reconnect backoff)
         btManager->tick();
         commands.tick();
+
+        // Push the state to subscribed clients whenever it changes, so the bar
+        // widget never has to read the state file. The comparison runs at most
+        // once per 100 ms poll cycle and only sends when something differs.
+        if (ipcServer.getSubscriberCount() > 0) {
+            std::string statusJson = stateEngine.getStatusJson();
+            if (statusJson != lastPublishedStatus) {
+                lastPublishedStatus = statusJson;
+                ipcServer.broadcastStatus(statusJson);
+            }
+        }
     }
 
     // 8. Graceful Shutdown & Resource Cleanup

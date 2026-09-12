@@ -1069,6 +1069,97 @@ void testIpcServer() {
 // taking the sequence number from its notifications made the next command
 // time out before its retry landed.
 // ---------------------------------------------------------------------------
+// The bar widget subscribes and is then pushed every state change, so it never
+// reads the state file. A subscriber that stops reading must be dropped rather
+// than allowed to grow the daemon's memory.
+void testIpcSubscribeAndBroadcast() {
+    TEST_CASE("IpcServer subscribe/broadcast");
+
+    char tmpl[] = "/tmp/test_omasonyxm3_sub_XXXXXX";
+    char* sandbox = ::mkdtemp(tmpl);
+    TEST_ASSERT(sandbox != nullptr, "mkdtemp for subscribe test must succeed");
+    const std::string sockPath = std::string(sandbox) + "/test.sock";
+
+    std::string statusJson = R"({"schema_version":1,"connected":true,"battery_level":42})";
+
+    IpcServer server(sockPath);
+    IpcCallbacks cb;
+    cb.getStatusJson = [&statusJson]() { return statusJson; };
+    server.setCallbacks(cb);
+    TEST_ASSERT(server.start(), "IpcServer start must succeed");
+
+    auto connectClient = [&sockPath]() {
+        int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+        struct sockaddr_un addr{};
+        addr.sun_family = AF_UNIX;
+        std::strncpy(addr.sun_path, sockPath.c_str(), sizeof(addr.sun_path) - 1);
+        if (::connect(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) != 0) {
+            ::close(fd);
+            return -1;
+        }
+        return fd;
+    };
+    auto readLine = [](int fd, int tries = 20) {
+        std::string out;
+        char c = 0;
+        for (int i = 0; i < tries * 1000 && out.find('\n') == std::string::npos; ++i) {
+            ssize_t n = ::recv(fd, &c, 1, MSG_DONTWAIT);
+            if (n == 1) out.push_back(c);
+            else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
+            else if (n <= 0) break;
+        }
+        return out;
+    };
+
+    const int subscriber = connectClient();
+    const int bystander = connectClient();
+    TEST_ASSERT(subscriber >= 0 && bystander >= 0, "both clients must connect");
+    server.pollOnce(50);
+    TEST_ASSERT_EQ(server.getClientCount(), 2UL, "server must hold two clients");
+    TEST_ASSERT_EQ(server.getSubscriberCount(), 0UL, "nobody is subscribed yet");
+
+    ::send(subscriber, "subscribe\n", 10, 0);
+    server.pollOnce(50);
+    TEST_ASSERT_EQ(server.getSubscriberCount(), 1UL, "subscribe must register the session");
+    TEST_ASSERT_EQ(readLine(subscriber), statusJson + "\n", "subscribe answers with the current status");
+
+    statusJson = R"({"schema_version":1,"connected":true,"battery_level":41})";
+    server.broadcastStatus(statusJson);
+    TEST_ASSERT_EQ(readLine(subscriber), statusJson + "\n", "a state change is pushed to the subscriber");
+    TEST_ASSERT_EQ(readLine(bystander), std::string(), "a client that never subscribed is not pushed to");
+
+    // A status is only sent whole: broadcastStatus appends the newline itself.
+    server.broadcastStatus(statusJson + "\n");
+    TEST_ASSERT_EQ(readLine(subscriber), statusJson + "\n", "an already terminated status is not doubled");
+
+    ::send(subscriber, "unsubscribe\n", 12, 0);
+    server.pollOnce(50);
+    TEST_ASSERT_EQ(readLine(subscriber), "OK\n", "unsubscribe is acknowledged");
+    TEST_ASSERT_EQ(server.getSubscriberCount(), 0UL, "unsubscribe clears the session");
+    server.broadcastStatus(statusJson);
+    TEST_ASSERT_EQ(readLine(subscriber), std::string(), "nothing is pushed after unsubscribe");
+
+    // A subscriber that stops reading: the queue must be capped and the client
+    // dropped, not grown without bound.
+    ::send(subscriber, "subscribe\n", 10, 0);
+    server.pollOnce(50);
+    TEST_ASSERT_EQ(server.getSubscriberCount(), 1UL, "resubscribe works");
+    const std::string bulky = R"({"schema_version":1,"padding":")" + std::string(8192, 'x') + R"("})";
+    for (int i = 0; i < 200 && server.getSubscriberCount() > 0; ++i) {
+        server.broadcastStatus(bulky);
+    }
+    TEST_ASSERT_EQ(server.getSubscriberCount(), 0UL, "a subscriber that stops reading is dropped");
+    TEST_ASSERT_EQ(server.getClientCount(), 1UL, "only the stalled client is dropped");
+
+    ::close(subscriber);
+    ::close(bystander);
+    server.stop();
+    ::unlink(sockPath.c_str());
+    ::rmdir(sandbox);
+
+    TEST_PASS("IpcServer subscribe/broadcast");
+}
+
 void testCommandQueue() {
     TEST_CASE("CommandQueue");
 
@@ -1273,6 +1364,7 @@ int main() {
     testMockTransportAndBluetoothManager();
     testStateEngine();
     testIpcServer();
+    testIpcSubscribeAndBroadcast();
     testCommandQueue();
     testDeviceFeatures();
 

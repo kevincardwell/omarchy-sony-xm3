@@ -62,7 +62,7 @@ checks for an adapter and a paired headset and warns you if either is missing.
 - 🗂️ **Two tabs** — *Sound* and *Device*, so the panel stays short.
 - ⌨️ **Keyboard navigation** — vim-style (`h`/`j`/`k`/`l`, `Enter`, `Esc`) in the panel.
 - 💻 **CLI (`sony-xm3-ctl`)** — everything the panel does, scriptable.
-- ⚡ **No polling** — native BlueZ RFCOMM plus a file-watched state file.
+- ⚡ **No polling** — native BlueZ RFCOMM, and the daemon pushes each state change to the panel over its socket.
 
 ---
 
@@ -98,12 +98,11 @@ back to 19 until it answers.
 │   └───────▲───────┘ └──────▲──────┘ └──────▲───────┘   │
 │           │                │               │           │
 │           └────────────────┼───────────────┘           │
-│                            │ watches (FileView)        │
-│                 ~/.local/state/sony-xm3/               │
-│                        status.json                     │
-│                            ▲                           │
+│                            │ one UNIX socket:          │
+│                            │ commands out,             │
+│                            │ state pushed back         │
 └────────────────────────────┼───────────────────────────┘
-                             │ writes (atomic, 0600)
+                             │
 ┌────────────────────────────┼───────────────────────────┐
 │  Headless Daemon           │      Companion CLI        │
 │  (sony-xm3-daemon)         │      (sony-xm3-ctl)       │
@@ -111,6 +110,9 @@ back to 19 until it answers.
 │   UNIX Domain Socket ◄─────┴────────────┘              │
 │   (/run/user/$UID/sony-xm3.sock)                       │
 │                 │                                      │
+│                 │  also writes ~/.local/state/         │
+│                 │  sony-xm3/status.json (0600) for     │
+│                 │  scripts that want to read it        │
 │                 ▼                                      │
 │   Bluetooth RFCOMM  (MDR v1 / table 1 protocol)        │
 │                 │  (channel resolved over SDP)         │
@@ -118,6 +120,14 @@ back to 19 until it answers.
 │       Sony WH-1000XM3                                  │
 └────────────────────────────────────────────────────────┘
 ```
+
+The widget lives inside the long-lived shell process, so it keeps that side as
+narrow as it can: it starts no processes, resolves nothing through `PATH` and
+opens no files. It connects to the daemon's socket in this login session's
+runtime directory (`/run/user/<uid>`), refusing any other path, sends
+`subscribe`, and is then pushed every state change. Replies are bounded, and a
+daemon that stops answering within five seconds is dropped and retried with a
+backoff rather than left holding the queue.
 
 - **Plugin** (`Panel.qml`, `Service.qml`, `Model.js`, `SonyIcon.qml`) — Quickshell/QML, Omarchy manifest schema 1.
 - **`daemon/`** — C++20 daemon owning the RFCOMM link and the UNIX socket.
