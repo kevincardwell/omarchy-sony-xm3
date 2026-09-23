@@ -2,139 +2,52 @@
 
 #include "MDRProtocolV1.hpp"
 #include <string>
-#include <filesystem>
-#include <mutex>
 #include <functional>
-#include <optional>
-#include <vector>
 #include <array>
-#include <span>
 
 namespace omarchy::sony {
 
-// State modification listener callback
-using StateListener = std::function<void(const protocol::HeadphoneState&)>;
-
+// The daemon's view of the headset, held in memory only. Clients read it over
+// the socket (`status`, or `subscribe` for every change), so nothing is
+// written to disk.
 class StateEngine {
 public:
-    // Constructor accepts an optional custom state directory or file path.
-    // If empty, standard XDG path resolution is performed.
-    explicit StateEngine(const std::filesystem::path& customStatePath = "");
-    ~StateEngine();
+    StateEngine();
 
-    // Non-copyable, non-movable
-    StateEngine(const StateEngine&) = delete;
-    StateEngine& operator=(const StateEngine&) = delete;
-    StateEngine(StateEngine&&) = delete;
-    StateEngine& operator=(StateEngine&&) = delete;
+    [[nodiscard]] const protocol::HeadphoneState& getState() const noexcept { return state_; }
+    // For the inbound parser, which writes the fields a reply carries.
+    [[nodiscard]] protocol::HeadphoneState& state() noexcept { return state_; }
+    [[nodiscard]] std::string getStatusJson() const { return state_.toJson(); }
 
-    // -----------------------------------------------------------------------
-    // Path Resolution & Filesystem Lifecycle
-    // -----------------------------------------------------------------------
-    static std::filesystem::path resolveStateFilePath(const std::filesystem::path& customStatePath = "");
-    static bool ensureStateDirectory(const std::filesystem::path& dirPath);
-
-    // Initializer: creates directories and commits initial status.json
-    bool initialize(bool initialConnected = true);
-    bool init() { return initialize(true); }
-
-    // Shutdown cleanup: unlinks status.json and any stale temporary files
-    void cleanup();
-
-    // -----------------------------------------------------------------------
-    // Atomic Persistence Engine
-    // -----------------------------------------------------------------------
-    // Writes JSON content to <status.json>.tmp.<pid> with mode 0600,
-    // calls fsync(), closes, and renames atomically to <status.json>.
-    bool writeAtomic(const std::string& jsonContent);
-
-    // Formats the current state and writes to disk atomically
-    bool commit();
-    bool save() { return commit(); }
-
-    // -----------------------------------------------------------------------
-    // State Accessors (Thread-Safe)
-    // -----------------------------------------------------------------------
-    [[nodiscard]] protocol::HeadphoneState getState() const;
-    [[nodiscard]] protocol::HeadphoneState& getStateUnsafe() noexcept { return state_; }
-    [[nodiscard]] std::string getStatusJson() const;
-    [[nodiscard]] bool isConnected() const;
-    [[nodiscard]] const std::filesystem::path& getStateFilePath() const noexcept { return stateFilePath_; }
-    [[nodiscard]] std::string getStatusFilePath() const { return stateFilePath_.string(); }
-    [[nodiscard]] const std::filesystem::path& getStateDirectory() const noexcept { return stateDir_; }
-
-    // -----------------------------------------------------------------------
-    // Inbound Protocol Integration
-    // -----------------------------------------------------------------------
-    bool updateFromInbound(std::span<const uint8_t> payload);
-
-    // -----------------------------------------------------------------------
-    // State Mutators
-    // -----------------------------------------------------------------------
-    void setConnected(bool connected, const std::string& deviceName = "WH-1000XM3");
-    void setDeviceName(const std::string& name);
-    void setBatteryLevel(int level);
-    void setCharging(bool charging);
+    void setConnected(bool connected, const std::string& deviceName = "");
     void setBattery(int level, bool charging);
 
+    // Setters that take a name validate it and refuse anything unknown.
     bool setNoiseMode(const std::string& mode);
-    bool updateNoiseMode(const std::string& mode, int ambientLevel = 0, bool voiceFocus = false);
-
+    bool updateNoiseMode(const std::string& mode, int ambientLevel, bool voiceFocus);
     bool setAmbientLevel(int level);
-    bool updateAmbientLevel(int level) { return setAmbientLevel(level); }
-    void setAmbientMaxLevel(int maxLevel);
-
-    bool setVoicePassthrough(bool passthrough);
-
+    void setAmbientMaxLevel(int maxLevel) { state_.ambient_max_level = maxLevel; }
+    void setVoicePassthrough(bool passthrough) { state_.voice_passthrough = passthrough; }
     bool setEqPreset(const std::string& preset);
-    bool updateEqPreset(const std::string& preset) { return setEqPreset(preset); }
-
     // slot: "custom" (Manual), "user1" or "user2"
-    bool setCustomEq(const std::array<int, 5>& bands, int clearBass, const std::string& slot = "custom");
-    bool updateCustomEq(const std::array<int, 5>& bands, int clearBass, const std::string& slot = "custom") {
-        return setCustomEq(bands, clearBass, slot);
-    }
-
-    // DSEE HX upscaling (the XM3's equivalent of the XM4/XM5 "DSEE Extreme").
-    void setDsee(bool enabled);
-    void updateDsee(bool enabled) { setDsee(enabled); }
-
-    // VPT surround preset: off | outdoor | arena | concert | club
+    bool setCustomEq(const std::array<int, 5>& bands, int clearBass, const std::string& slot);
+    void setDsee(bool enabled) { state_.dsee_hx = enabled; }
     bool setSurround(const std::string& preset);
-    // VPT sound position: off | front-left | front-right | front | rear-left | rear-right
     bool setSoundPosition(const std::string& position);
-    // Auto power off: off | 5min | 30min | 60min | 180min
     bool setAutoPowerOff(const std::string& timer);
-    // Bluetooth link preference: quality | stable
     bool setConnectionMode(const std::string& mode);
+    void setCodec(const std::string& codec) { state_.codec = codec; }
 
-    void setCodec(const std::string& codec);
-
-    // Transactional mutation
-    void modifyState(const std::function<void(protocol::HeadphoneState&)>& mutator);
-    void setState(const protocol::HeadphoneState& newState);
-
-    // -----------------------------------------------------------------------
-    // Listeners & Notifications
-    // -----------------------------------------------------------------------
-    void addListener(StateListener listener);
+    void modifyState(const std::function<void(protocol::HeadphoneState&)>& mutator) { mutator(state_); }
 
 private:
-    std::string serializeStateLocked() const;
-    void notifyListenersLocked();
-    void touchAndPublishLocked(std::string& outJson);
-
-    mutable std::mutex mutex_;
-    std::filesystem::path stateFilePath_;
-    std::filesystem::path stateDir_;
     protocol::HeadphoneState state_;
-    std::vector<StateListener> listeners_;
-    bool cleanedUp_{false};
 };
 
-} // namespace omarchy::sony
+// Low-battery warnings, at 20% and again at 10%. Returns the threshold to warn
+// about now, or 0. `warned` (start it at 0) remembers the lowest threshold
+// already announced, so a reconnect at the same level stays quiet; charging,
+// or the level rising back above a threshold, re-arms it.
+int batteryWarning(int level, bool charging, int& warned);
 
-namespace omarchy::sony::daemon {
-    using StateEngine = omarchy::sony::StateEngine;
-    using StateListener = omarchy::sony::StateListener;
-}
+} // namespace omarchy::sony

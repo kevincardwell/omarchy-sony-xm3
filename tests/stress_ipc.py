@@ -28,9 +28,7 @@ class TestFailure(Exception):
 class DaemonHarness:
     def __init__(self):
         self.tmp_dir = tempfile.TemporaryDirectory(prefix="omasonyxm3_ipc_stress_")
-        self.state_dir = Path(self.tmp_dir.name) / "state"
         self.runtime_dir = Path(self.tmp_dir.name) / "run"
-        self.state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.runtime_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.socket_path = self.runtime_dir / "sony-xm3.sock"
         self.daemon_proc = None
@@ -47,7 +45,6 @@ class DaemonHarness:
         cmd = [
             str(self.daemon_bin),
             "--mock",
-            "--state-dir", str(self.state_dir),
             "--runtime-dir", str(self.runtime_dir)
         ]
         
@@ -319,7 +316,7 @@ def run_tests():
             # the headset in ambient mode: on the XM3 the level and the mode are
             # the same axis, so the later command wins over `noise anc`.
             json2 = json.loads(lines[8])
-            if json2.get("noise_mode") != "ambient" or json2.get("ambient_level") != 12:
+            if json2.get("noise_mode") != "ambient" or json2.get("ambient_sound_level") != 12:
                 raise TestFailure(f"Pipelined state updates not reflected in second status: {lines[8]}")
             if json2.get("eq_preset") != "vocal" or json2.get("voice_passthrough") is not True:
                 raise TestFailure(f"Pipelined EQ / voice focus not reflected: {lines[8]}")

@@ -47,6 +47,8 @@ struct IpcCallbacks {
     std::function<bool(bool enabled, std::string& errorMsg)> setTouchPanel;
     std::function<bool(bool enabled, std::string& errorMsg)> setVoiceGuidance;
     std::function<int()> getVolumeMax;
+    // Connects (true) or disconnects (false) the headset through BlueZ.
+    std::function<bool(bool connect, std::string& errorMsg)> setLink;
     std::function<bool(const std::vector<uint8_t>& packet)> sendPacket;
     // Upper bound the daemon will accept for `ambient-level`, learned from the
     // headset's NCASM capability response.

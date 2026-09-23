@@ -1,18 +1,13 @@
 #include "MDRProtocolV1.hpp"
 #include <algorithm>
 #include <sstream>
-#include <chrono>
+#include <cstdio>
 
 namespace omarchy::sony::protocol {
 
 namespace {
 
 constexpr uint8_t cmd(Command c) { return static_cast<uint8_t>(c); }
-
-int64_t nowSeconds() {
-    return std::chrono::duration_cast<std::chrono::seconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
-}
 
 std::string jsonArray(const std::array<int, 5>& v) {
     std::ostringstream ss;
@@ -26,58 +21,64 @@ std::string jsonArray(const std::array<int, 5>& v) {
 // HeadphoneState Implementation
 // ---------------------------------------------------------------------------
 
-std::string HeadphoneState::toJson() const {
-    if (!connected) {
-        return "{\"schema_version\":1,\"connected\":false}";
+// Strings here come from BlueZ and the headset, so they are escaped rather
+// than trusted to be JSON-safe.
+static std::string jsonString(const std::string& v) {
+    std::string out = "\"";
+    for (unsigned char c : v) {
+        if (c == '"' || c == '\\') { out += '\\'; out += static_cast<char>(c); }
+        else if (c < 0x20) { char buf[8]; std::snprintf(buf, sizeof(buf), "\\u%04x", c); out += buf; }
+        else out += static_cast<char>(c);
     }
+    return out + "\"";
+}
 
-    const std::string bands = jsonArray(eq_custom_bands);
-
+std::string HeadphoneState::toJson() const {
+    const char* t = "true";
+    const char* f = "false";
     std::ostringstream ss;
     ss << "{"
        << "\"schema_version\":" << schema_version << ","
-       << "\"connected\":true,"
-       << "\"device_name\":\"" << device_name << "\","
-       << "\"battery_level\":" << battery_level << ","
-       << "\"charging\":" << (battery_charging ? "true" : "false") << ","
-       << "\"battery_charging\":" << (battery_charging ? "true" : "false") << ","
-       << "\"noise_mode\":\"" << noise_mode << "\","
-       << "\"ambient_level\":" << ambient_sound_level << ","
+       << "\"connected\":" << (connected ? t : f) << ","
+       << "\"paired\":" << (paired ? t : f) << ","
+       << "\"link_state\":" << jsonString(link_state) << ","
+       << "\"link_error\":" << jsonString(link_error) << ","
+       << "\"device_name\":" << jsonString(device_name) << ","
+       << "\"battery_level\":" << battery_level;
+    // Everything else is only known while the control channel is up; the last
+    // battery reading is kept so a disconnected panel can still show it.
+    if (!connected) {
+        ss << "}";
+        return ss.str();
+    }
+    ss << ","
+       << "\"battery_charging\":" << (battery_charging ? t : f) << ","
+       << "\"noise_mode\":" << jsonString(noise_mode) << ","
        << "\"ambient_sound_level\":" << ambient_sound_level << ","
        << "\"ambient_max_level\":" << ambient_max_level << ","
-       << "\"voice_passthrough\":" << (voice_passthrough ? "true" : "false") << ","
-       << "\"eq_preset\":\"" << eq_preset << "\","
-       << "\"eq_bands\":" << bands << ","
-       << "\"eq_custom_bands\":" << bands << ","
+       << "\"voice_passthrough\":" << (voice_passthrough ? t : f) << ","
+       << "\"eq_preset\":" << jsonString(eq_preset) << ","
+       << "\"eq_custom_bands\":" << jsonArray(eq_custom_bands) << ","
        << "\"clear_bass\":" << clear_bass << ","
-       << "\"dsee\":" << (dsee_hx ? "true" : "false") << ","
-       << "\"dsee_hx\":" << (dsee_hx ? "true" : "false") << ","
-       << "\"dsee_hx_active\":" << (dsee_hx_active ? "true" : "false") << ","
-       << "\"surround\":\"" << surround << "\","
-       << "\"sound_position\":\"" << sound_position << "\","
-       << "\"auto_power_off\":\"" << auto_power_off << "\","
-       << "\"connection_mode\":\"" << connection_mode << "\","
-       << "\"codec\":\"" << codec << "\","
-       << "\"firmware_version\":\"" << firmware_version << "\","
-       << "\"optimizer_state\":\"" << optimizer_state << "\","
-       << "\"optimizer_pressure\":\"" << optimizer_pressure << "\","
+       << "\"dsee_hx\":" << (dsee_hx ? t : f) << ","
+       << "\"dsee_hx_active\":" << (dsee_hx_active ? t : f) << ","
+       << "\"surround\":" << jsonString(surround) << ","
+       << "\"sound_position\":" << jsonString(sound_position) << ","
+       << "\"auto_power_off\":" << jsonString(auto_power_off) << ","
+       << "\"connection_mode\":" << jsonString(connection_mode) << ","
+       << "\"codec\":" << jsonString(codec) << ","
+       << "\"firmware_version\":" << jsonString(firmware_version) << ","
+       << "\"optimizer_state\":" << jsonString(optimizer_state) << ","
+       << "\"optimizer_pressure\":" << jsonString(optimizer_pressure) << ","
        << "\"volume\":" << volume << ","
        << "\"volume_max\":" << volume_max << ","
-       << "\"nc_button\":\"" << nc_button << "\","
-       << "\"touch_panel\":" << (touch_panel ? "true" : "false") << ","
-       << "\"voice_guidance\":" << (voice_guidance ? "true" : "false") << ","
-       << "\"voice_guidance_language\":\"" << voice_guidance_language << "\","
-       << "\"model_name\":\"" << model_name << "\","
-       << "\"last_updated\":" << last_updated
+       << "\"nc_button\":" << jsonString(nc_button) << ","
+       << "\"touch_panel\":" << (touch_panel ? t : f) << ","
+       << "\"voice_guidance\":" << (voice_guidance ? t : f) << ","
+       << "\"voice_guidance_language\":" << jsonString(voice_guidance_language) << ","
+       << "\"model_name\":" << jsonString(model_name)
        << "}";
     return ss.str();
-}
-
-HeadphoneState HeadphoneState::makeDisconnected() {
-    HeadphoneState s;
-    s.schema_version = 1;
-    s.connected = false;
-    return s;
 }
 
 // ---------------------------------------------------------------------------
@@ -677,7 +678,7 @@ bool parseInboundPayload(std::span<const uint8_t> payload, HeadphoneState& state
             state.eq_preset = eqPresetToString(static_cast<EqPreset>(payload[2]));
             // Band steps are [Clear Bass, band0..band4], each biased by +10.
             // A corrupt byte would otherwise decode to something like +245, so
-            // clamp here rather than leaking it into status.json.
+            // clamp here rather than leaking it into the status.
             if (payload.size() >= 10 && payload[3] == 0x06) {
                 auto decode = [](uint8_t raw) {
                     return std::clamp(static_cast<int>(raw) - 10, -10, 10);
@@ -769,7 +770,6 @@ bool parseInboundPayload(std::span<const uint8_t> payload, HeadphoneState& state
 
     if (updated) {
         state.connected = true;
-        state.last_updated = nowSeconds();
     }
     return updated;
 }
@@ -794,7 +794,6 @@ bool parseInboundPayloadT2(std::span<const uint8_t> payload, HeadphoneState& sta
 
     if (updated) {
         state.connected = true;
-        state.last_updated = nowSeconds();
     }
     return updated;
 }

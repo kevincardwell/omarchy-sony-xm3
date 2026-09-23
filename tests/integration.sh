@@ -3,16 +3,16 @@
 # tests/integration.sh — End-to-End Simulation & Verification Test Suite
 # Project: omarchy-sony-xm3 (Sony WH-1000XM3 Plugin & Headless Daemon)
 # ==============================================================================
-# This script executes a complete, self-contained offline simulation validating
-# daemon state management, UNIX domain socket IPC, CLI command execution,
-# data model parsing, and panel reactivity across Tiers 1 through 4.
-# Zero physical Bluetooth hardware required.
+# Runs this checkout's real daemon in --mock mode (build/daemon/sony-xm3-daemon)
+# against this checkout's CLI (build/cli/sony-xm3-ctl), validating daemon state
+# management, UNIX domain socket IPC and CLI command execution across Tiers 1-4.
+# State is read back over the socket (`status`). Zero Bluetooth hardware required.
+# Model.js is covered separately by tests/model.test.js.
 # ==============================================================================
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-FIXTURES_DIR="$SCRIPT_DIR/fixtures"
 
 # Colors for terminal output
 RED='\033[0;31m'
@@ -57,12 +57,8 @@ section_header() {
 # 1. Environment Sandbox Setup
 # ------------------------------------------------------------------------------
 SANDBOX_DIR=$(mktemp -d /tmp/omasonyxm3-e2e.XXXXXX)
-export XDG_STATE_HOME="$SANDBOX_DIR/state"
 export XDG_RUNTIME_DIR="$SANDBOX_DIR/run"
-export XDG_CONFIG_HOME="$SANDBOX_DIR/config"
 
-SONY_STATE_DIR="$XDG_STATE_HOME/sony-xm3"
-STATUS_FILE="$SONY_STATE_DIR/status.json"
 SOCKET_FILE="$XDG_RUNTIME_DIR/sony-xm3.sock"
 
 DAEMON_PID=""
@@ -77,54 +73,39 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 # ------------------------------------------------------------------------------
-# 2. Locate or Fall Back to CLI Binary
+# 2. Locate This Checkout's Build (the suite tests the tree, not an install)
 # ------------------------------------------------------------------------------
-CLI_BIN=""
-if command -v sony-xm3-ctl >/dev/null 2>&1; then
-  CLI_BIN="sony-xm3-ctl"
-  CLI_TYPE="system binary ($(command -v sony-xm3-ctl))"
-elif [[ -x "$REPO_ROOT/cli/build/sony-xm3-ctl" ]]; then
-  CLI_BIN="$REPO_ROOT/cli/build/sony-xm3-ctl"
-  CLI_TYPE="build binary ($CLI_BIN)"
-elif [[ -x "$REPO_ROOT/build/cli/sony-xm3-ctl" ]]; then
-  CLI_BIN="$REPO_ROOT/build/cli/sony-xm3-ctl"
-  CLI_TYPE="build binary ($CLI_BIN)"
-elif [[ -x "$HOME/.local/bin/sony-xm3-ctl" ]]; then
-  CLI_BIN="$HOME/.local/bin/sony-xm3-ctl"
-  CLI_TYPE="user bin ($CLI_BIN)"
-else
-  CLI_BIN="$SCRIPT_DIR/mock_sony_xm3_ctl.py"
-  CLI_TYPE="built-in reference simulation client ($CLI_BIN)"
-fi
+DAEMON_BIN="${DAEMON_BIN:-$REPO_ROOT/build/daemon/sony-xm3-daemon}"
+CLI_BIN="${CLI_BIN:-$REPO_ROOT/build/cli/sony-xm3-ctl}"
+for bin in "$DAEMON_BIN" "$CLI_BIN"; do
+  if [[ ! -x "$bin" ]]; then
+    printf "${RED}Not built: %s${NC}\n" "$bin" >&2
+    echo "Build first: cmake -B build -G Ninja && cmake --build build" >&2
+    exit 1
+  fi
+done
 
 echo -e "${BOLD}omarchy-sony-xm3 End-to-End Simulation & Verification Test Suite${NC}"
 echo "Repository:  $REPO_ROOT"
 echo "Sandbox:     $SANDBOX_DIR"
-echo "CLI Driver:  $CLI_TYPE"
-echo "Fixtures:    $FIXTURES_DIR"
+echo "Daemon:      $DAEMON_BIN --mock"
+echo "CLI:         $CLI_BIN"
 
 # Helper to run CLI with isolated socket
 run_cli() {
   "$CLI_BIN" -s "$SOCKET_FILE" "$@"
 }
 
-# Helper to write status atomically
-write_status_atomic() {
-  local json_content="$1"
-  mkdir -p "$SONY_STATE_DIR"
-  local tmp="$STATUS_FILE.tmp.$$"
-  echo "$json_content" > "$tmp"
-  chmod 0600 "$tmp"
-  mv -f "$tmp" "$STATUS_FILE"
+# Helper to read the daemon's current state over the socket
+get_status() {
+  run_cli status 2>/dev/null || true
 }
 
-# Helper to start mock daemon
+# Helper to start the daemon in mock mode
 start_daemon() {
   local ready_file="$SANDBOX_DIR/daemon_ready"
   rm -f "$ready_file"
-  python3 "$SCRIPT_DIR/mock_daemon.py" \
-    --state-dir "$XDG_STATE_HOME" \
-    --runtime-dir "$XDG_RUNTIME_DIR" > "$ready_file" 2>&1 &
+  "$DAEMON_BIN" --mock --runtime-dir "$XDG_RUNTIME_DIR" > "$ready_file" 2>&1 &
   DAEMON_PID=$!
   local max_wait=30
   local count=0
@@ -132,14 +113,14 @@ start_daemon() {
     sleep 0.1
     count=$((count + 1))
     if [[ $count -ge $max_wait ]]; then
-      echo "Failed to start mock daemon within 3 seconds"
+      echo "Failed to start daemon within 3 seconds"
       cat "$ready_file" 2>/dev/null || true
       exit 1
     fi
   done
 }
 
-# Helper to stop mock daemon
+# Helper to stop the daemon
 stop_daemon() {
   if [[ -n "$DAEMON_PID" ]] && kill -0 "$DAEMON_PID" 2>/dev/null; then
     kill -TERM "$DAEMON_PID" 2>/dev/null || true
@@ -151,83 +132,69 @@ stop_daemon() {
 # ==============================================================================
 # TIER 1: FEATURE COVERAGE (>=5 tests per component)
 # ==============================================================================
-section_header "Tier 1: Feature Coverage (Daemon, CLI, Plugin Model)"
+section_header "Tier 1: Feature Coverage (Daemon, CLI)"
 
 # ------------------------------------------------------------------------------
 # Feature 1.1: Daemon State & IPC Protocol (>=5 test cases)
 # ------------------------------------------------------------------------------
 start_daemon
 
-# T1.D1: Daemon startup directory initialization
-if [[ -d "$SONY_STATE_DIR" && -d "$XDG_RUNTIME_DIR" ]]; then
-  pass_test "T1.D1" "Daemon initializes state and runtime directories"
+# T1.D1: Daemon startup runtime directory and socket
+if [[ -d "$XDG_RUNTIME_DIR" && -S "$SOCKET_FILE" ]]; then
+  pass_test "T1.D1" "Daemon initializes runtime directory and socket"
 else
-  fail_test "T1.D1" "Daemon failed to initialize state or runtime directory"
+  fail_test "T1.D1" "Daemon failed to create runtime directory or socket"
 fi
 
-# T1.D2: Atomic initial status.json generation
-if [[ -f "$STATUS_FILE" ]] && jq -e '.schema_version == 1 and .connected == true and .device_name == "WH-1000XM3"' "$STATUS_FILE" >/dev/null 2>&1; then
-  pass_test "T1.D2" "Daemon creates valid initial status.json matching schema_version 1"
-else
-  fail_test "T1.D2" "status.json missing or does not match schema_version 1"
-fi
-
-# T1.D3: File permissions security (0600 for status.json)
-perms=$(stat -c "%a" "$STATUS_FILE" 2>/dev/null || stat -f "%Lp" "$STATUS_FILE" 2>/dev/null)
-if [[ "$perms" == "600" || "$perms" == "0600" ]]; then
-  pass_test "T1.D3" "status.json file permissions are strictly 0600 (owner-only)"
-else
-  fail_test "T1.D3" "status.json permissions are $perms, expected 0600"
-fi
-
-# T1.D4: Socket IPC status query
-status_out=$(run_cli status 2>/dev/null || true)
-if echo "$status_out" | jq -e '.schema_version == 1 and .device_name == "WH-1000XM3"' >/dev/null 2>&1; then
-  pass_test "T1.D4" "Socket IPC responds to 'status' with valid JSON snapshot"
+# T1.D4: Socket IPC status query (schema 1, connected mock, no legacy keys)
+status_out=$(get_status)
+if echo "$status_out" | jq -e '.schema_version == 1 and .connected == true and .device_name == "WH-1000XM3"
+    and ([has("charging", "ambient_level", "eq_bands", "dsee", "last_updated")] | any | not)' >/dev/null 2>&1; then
+  pass_test "T1.D4" "Socket IPC responds to 'status' with valid schema 1 JSON, no legacy keys"
 else
   fail_test "T1.D4" "Socket IPC failed to respond to 'status'" "Got: $status_out"
 fi
 
-# T1.D5: Socket IPC noise mode modification and persistence
+# T1.D5: Socket IPC noise mode modification
 run_cli noise ambient >/dev/null 2>&1 || true
-if jq -e '.noise_mode == "ambient"' "$STATUS_FILE" >/dev/null 2>&1; then
-  pass_test "T1.D5" "Daemon updates noise_mode to 'ambient' via IPC and persists to file"
+if jq -e '.noise_mode == "ambient"' <<<"$(get_status)" >/dev/null 2>&1; then
+  pass_test "T1.D5" "Daemon updates noise_mode to 'ambient' via IPC"
 else
-  fail_test "T1.D5" "noise_mode was not updated to 'ambient'" "$(cat "$STATUS_FILE")"
+  fail_test "T1.D5" "noise_mode was not updated to 'ambient'" "$(get_status)"
 fi
 
-# T1.D6: Socket IPC ambient-level modification and persistence
+# T1.D6: Socket IPC ambient-level modification
 run_cli ambient-level 16 >/dev/null 2>&1 || true
-if jq -e '.ambient_sound_level == 16' "$STATUS_FILE" >/dev/null 2>&1; then
-  pass_test "T1.D6" "Daemon updates ambient_sound_level to 16 via IPC and persists to file"
+if jq -e '.ambient_sound_level == 16' <<<"$(get_status)" >/dev/null 2>&1; then
+  pass_test "T1.D6" "Daemon updates ambient_sound_level to 16 via IPC"
 else
-  fail_test "T1.D6" "ambient_sound_level was not updated to 16" "$(cat "$STATUS_FILE")"
+  fail_test "T1.D6" "ambient_sound_level was not updated to 16" "$(get_status)"
 fi
 
 # T1.D7: Socket IPC EQ preset modification
 run_cli eq vocal >/dev/null 2>&1 || true
-if jq -e '.eq_preset == "vocal"' "$STATUS_FILE" >/dev/null 2>&1; then
-  pass_test "T1.D7" "Daemon updates eq_preset to 'vocal' via IPC and persists to file"
+if jq -e '.eq_preset == "vocal"' <<<"$(get_status)" >/dev/null 2>&1; then
+  pass_test "T1.D7" "Daemon updates eq_preset to 'vocal' via IPC"
 else
-  fail_test "T1.D7" "eq_preset was not updated to 'vocal'" "$(cat "$STATUS_FILE")"
+  fail_test "T1.D7" "eq_preset was not updated to 'vocal'" "$(get_status)"
 fi
 
 # T1.D8: Socket IPC Custom EQ bands modification
 run_cli eq custom 2 1 -1 3 0 4 >/dev/null 2>&1 || true
-if jq -e '.eq_preset == "custom" and .eq_custom_bands == [2, 1, -1, 3, 0] and .clear_bass == 4' "$STATUS_FILE" >/dev/null 2>&1; then
-  pass_test "T1.D8" "Daemon updates custom EQ bands and clear_bass via IPC and persists"
+if jq -e '.eq_preset == "custom" and .eq_custom_bands == [2, 1, -1, 3, 0] and .clear_bass == 4' <<<"$(get_status)" >/dev/null 2>&1; then
+  pass_test "T1.D8" "Daemon updates custom EQ bands and clear_bass via IPC"
 else
-  fail_test "T1.D8" "Custom EQ bands were not updated properly" "$(cat "$STATUS_FILE")"
+  fail_test "T1.D8" "Custom EQ bands were not updated properly" "$(get_status)"
 fi
 
 # T1.D9: Socket IPC toggles (Focus on Voice, DSEE HX)
 run_cli noise ambient 12 >/dev/null 2>&1 || true
 run_cli voice-focus on >/dev/null 2>&1 || true
 run_cli dsee off >/dev/null 2>&1 || true
-if jq -e '.voice_passthrough == true and .dsee_hx == false' "$STATUS_FILE" >/dev/null 2>&1; then
+if jq -e '.voice_passthrough == true and .dsee_hx == false' <<<"$(get_status)" >/dev/null 2>&1; then
   pass_test "T1.D9" "Daemon updates feature switches (Focus on Voice, DSEE HX)"
 else
-  fail_test "T1.D9" "Feature toggles were not updated properly" "$(cat "$STATUS_FILE")"
+  fail_test "T1.D9" "Feature toggles were not updated properly" "$(get_status)"
 fi
 
 # T1.D9b: Enum-valued XM3 settings (Surround, Sound Position, Auto Power Off, Connection)
@@ -235,10 +202,10 @@ run_cli surround concert >/dev/null 2>&1 || true
 run_cli sound-position rear-left >/dev/null 2>&1 || true
 run_cli auto-power-off 30min >/dev/null 2>&1 || true
 run_cli connection stable >/dev/null 2>&1 || true
-if jq -e '.surround == "concert" and .sound_position == "rear-left" and .auto_power_off == "30min" and .connection_mode == "stable"' "$STATUS_FILE" >/dev/null 2>&1; then
+if jq -e '.surround == "concert" and .sound_position == "rear-left" and .auto_power_off == "30min" and .connection_mode == "stable"' <<<"$(get_status)" >/dev/null 2>&1; then
   pass_test "T1.D9b" "Daemon updates VPT, auto power off and connection mode via IPC"
 else
-  fail_test "T1.D9b" "Enum settings were not updated properly" "$(cat "$STATUS_FILE")"
+  fail_test "T1.D9b" "Enum settings were not updated properly" "$(get_status)"
 fi
 
 # T1.D9d: On LDAC the XM3 cannot run EQ or VPT; the daemon refuses up front
@@ -271,10 +238,10 @@ run_cli volume 12 >/dev/null 2>&1 || true
 run_cli nc-button alexa >/dev/null 2>&1 || true
 run_cli touch-panel off >/dev/null 2>&1 || true
 run_cli voice-guidance off >/dev/null 2>&1 || true
-if jq -e '.volume == 12 and .nc_button == "alexa" and .touch_panel == false and .voice_guidance == false' "$STATUS_FILE" >/dev/null 2>&1; then
+if jq -e '.volume == 12 and .nc_button == "alexa" and .touch_panel == false and .voice_guidance == false' <<<"$(get_status)" >/dev/null 2>&1; then
   pass_test "T1.D9f" "Volume, NC button, touch panel and voice guidance update via IPC"
 else
-  fail_test "T1.D9f" "Device settings were not updated properly" "$(cat "$STATUS_FILE")"
+  fail_test "T1.D9f" "Device settings were not updated properly" "$(get_status)"
 fi
 run_cli nc-button ambient >/dev/null 2>&1 || true
 run_cli touch-panel on >/dev/null 2>&1 || true
@@ -282,7 +249,7 @@ run_cli voice-guidance on >/dev/null 2>&1 || true
 
 # T1.D9g: Custom EQ slots, the optimizer and playback are accepted; nonsense is not
 run_cli eq user1 3 2 1 0 -1 4 >/dev/null 2>&1 || true
-s_eq=$(jq -r '.eq_preset + ":" + (.clear_bass|tostring)' "$STATUS_FILE")
+s_eq=$(get_status | jq -r '.eq_preset + ":" + (.clear_bass|tostring)')
 set +e
 run_cli eq custom >/dev/null 2>&1;         c_manual=$?
 run_cli optimizer start >/dev/null 2>&1;   c_opt=$?
@@ -309,18 +276,34 @@ else
   fail_test "T1.D9c" "Unknown enum values were not rejected" "surround=$c_surround position=$c_position apo=$c_apo conn=$c_conn"
 fi
 
-# T1.D10: Disconnect state persistence
+# T1.D10: Simulated disconnect / reconnect signals (SIGUSR1 / SIGUSR2)
 kill -USR1 "$DAEMON_PID"
 sleep 0.2
-if jq -e '.schema_version == 1 and .connected == false' "$STATUS_FILE" >/dev/null 2>&1; then
-  pass_test "T1.D10" "Daemon writes connected:false payload on Bluetooth disconnect without unlinking"
-else
-  fail_test "T1.D10" "status.json did not record connected:false on disconnect"
-fi
-
-# Reconnect for remaining tests
+s_down=$(get_status)
 kill -USR2 "$DAEMON_PID"
 sleep 0.2
+s_up=$(get_status)
+if jq -e '.schema_version == 1 and .connected == false' <<<"$s_down" >/dev/null 2>&1 &&
+   jq -e '.connected == true' <<<"$s_up" >/dev/null 2>&1; then
+  pass_test "T1.D10" "SIGUSR1 reports connected:false; SIGUSR2 restores connected:true"
+else
+  fail_test "T1.D10" "Signal disconnect/reconnect not reflected in status" "down=$s_down up=$s_up"
+fi
+
+# T1.D11: connect / disconnect verbs drive the (mock) link
+set +e
+run_cli disconnect >/dev/null 2>&1; c_down=$?
+s_down=$(get_status)
+run_cli connect >/dev/null 2>&1;    c_up=$?
+s_up=$(get_status)
+set -e
+if [[ $c_down -eq 0 && $c_up -eq 0 ]] &&
+   jq -e '.connected == false and .paired == true' <<<"$s_down" >/dev/null 2>&1 &&
+   jq -e '.connected == true' <<<"$s_up" >/dev/null 2>&1; then
+  pass_test "T1.D11" "disconnect reports connected:false (still paired); connect restores connected:true"
+else
+  fail_test "T1.D11" "connect/disconnect verbs misbehaved" "disconnect=$c_down connect=$c_up down=$s_down up=$s_up"
+fi
 
 # ------------------------------------------------------------------------------
 # Feature 1.2: CLI (sony-xm3-ctl) Features (>=5 test cases)
@@ -412,111 +395,10 @@ fi
 # Restart daemon for subsequent tests
 start_daemon
 
-# ------------------------------------------------------------------------------
-# Feature 1.3: Plugin Model Features (>=5 test cases)
-# ------------------------------------------------------------------------------
-# T1.P1: manifest.json schema validation (if file exists)
-if [[ -f "$REPO_ROOT/plugin/manifest.json" ]]; then
-  if /usr/share/omarchy/bin/omarchy-plugin-validate "$REPO_ROOT/plugin" >/dev/null 2>&1; then
-    pass_test "T1.P1" "omarchy-plugin-validate passes for plugin/manifest.json"
-  else
-    fail_test "T1.P1" "omarchy-plugin-validate reported validation failure"
-  fi
-else
-  pass_test "T1.P1" "plugin/manifest.json schema verified via project specification"
-fi
-
-# T1.P2 through T1.P6: Run Deno / Node model tests
-if command -v deno >/dev/null 2>&1; then
-  set +e
-  deno_out=$(deno run --allow-read "$SCRIPT_DIR/model.test.js" 2>&1)
-  deno_code=$?
-  set -e
-  if [[ $deno_code -eq 0 ]]; then
-    pass_test "T1.P2" "Model.js defaultStatus() structure and defaults verified via Deno"
-    pass_test "T1.P3" "Model.js parseStatus() connected payload parsing verified via Deno"
-    pass_test "T1.P4" "Model.js parseStatus() disconnected payload parsing verified via Deno"
-    pass_test "T1.P5" "Model.js noiseModeName() and eqPresetName() formatters verified via Deno"
-    pass_test "T1.P6" "Model.js batteryIcon(), formatBattery(), and levelFraction() verified via Deno"
-  else
-    fail_test "T1.P2" "Model.js unit test suite failed in Deno" "$deno_out"
-    fail_test "T1.P3" "Model.js unit test suite failed in Deno"
-    fail_test "T1.P4" "Model.js unit test suite failed in Deno"
-    fail_test "T1.P5" "Model.js unit test suite failed in Deno"
-    fail_test "T1.P6" "Model.js unit test suite failed in Deno"
-  fi
-elif command -v node >/dev/null 2>&1; then
-  set +e
-  node_out=$(node "$SCRIPT_DIR/model.test.js" 2>&1)
-  node_code=$?
-  set -e
-  if [[ $node_code -eq 0 ]]; then
-    pass_test "T1.P2" "Model.js defaultStatus() structure and defaults verified via Node"
-    pass_test "T1.P3" "Model.js parseStatus() connected payload parsing verified via Node"
-    pass_test "T1.P4" "Model.js parseStatus() disconnected payload parsing verified via Node"
-    pass_test "T1.P5" "Model.js noiseModeName() and eqPresetName() formatters verified via Node"
-    pass_test "T1.P6" "Model.js batteryIcon(), formatBattery(), and levelFraction() verified via Node"
-  else
-    fail_test "T1.P2" "Model.js unit test suite failed in Node" "$node_out"
-    fail_test "T1.P3" "Model.js unit test suite failed in Node"
-    fail_test "T1.P4" "Model.js unit test suite failed in Node"
-    fail_test "T1.P5" "Model.js unit test suite failed in Node"
-    fail_test "T1.P6" "Model.js unit test suite failed in Node"
-  fi
-fi
-
 # ==============================================================================
 # TIER 2: BOUNDARY & CORNER CASES
 # ==============================================================================
 section_header "Tier 2: Boundary & Corner Cases"
-
-# T2.B1: Empty status file (0 bytes)
-write_status_atomic ""
-if [[ -f "$FIXTURES_DIR/status_empty.json" ]]; then
-  pass_test "T2.B1" "Fixture status_empty.json (0 bytes) verified without reader crashes"
-else
-  fail_test "T2.B1" "Missing status_empty.json fixture"
-fi
-
-# T2.B2: Whitespace-only status file
-write_status_atomic "   \n\t  \n  "
-if [[ -f "$FIXTURES_DIR/status_whitespace.json" ]]; then
-  pass_test "T2.B2" "Fixture status_whitespace.json verified cleanly"
-else
-  fail_test "T2.B2" "Missing status_whitespace.json fixture"
-fi
-
-# T2.B3: Corrupted / truncated JSON
-write_status_atomic '{"schema_version": 1, "connected": true, "device_name": "WH-1000XM3", "battery_level":'
-if [[ -f "$FIXTURES_DIR/status_corrupted.json" ]]; then
-  pass_test "T2.B3" "Corrupted JSON fixture verified without process crash"
-else
-  fail_test "T2.B3" "Missing status_corrupted.json fixture"
-fi
-
-# T2.B4: Non-object JSON inputs (array / scalar)
-write_status_atomic '[1, 2, 3]'
-if [[ -f "$FIXTURES_DIR/status_non_object.json" ]]; then
-  pass_test "T2.B4" "Non-object JSON input fixture parsed safely without unhandled exception"
-else
-  fail_test "T2.B4" "Missing status_non_object.json fixture"
-fi
-
-# T2.B5: Missing schema_version field
-write_status_atomic '{"connected": true, "device_name": "WH-1000XM3"}'
-if [[ -f "$FIXTURES_DIR/status_missing_schema.json" ]]; then
-  pass_test "T2.B5" "Missing schema_version correctly identified as schema violation"
-else
-  fail_test "T2.B5" "Missing status_missing_schema.json fixture"
-fi
-
-# T2.B6: Unsupported future schema (schema_version: 99)
-write_status_atomic '{"schema_version": 99, "connected": true, "device_name": "WH-1000XM3"}'
-if [[ -f "$FIXTURES_DIR/status_schema_too_new.json" ]]; then
-  pass_test "T2.B6" "Future schema_version 99 identified with schemaTooNew flag"
-else
-  fail_test "T2.B6" "Missing status_schema_too_new.json fixture"
-fi
 
 # T2.B7: Ambient step boundary values. On the XM3 the axis runs 0..19, where 0
 #        is noise cancelling and 1 is wind noise reduction.
@@ -574,14 +456,6 @@ else
   fail_test "T2.B9" "Clear Bass boundary check failed"
 fi
 
-# T2.B10: Extreme values fixture
-write_status_atomic "$(cat "$FIXTURES_DIR/status_extreme_values.json")"
-if jq -e '.battery_level == 250 and .ambient_sound_level == 99' "$STATUS_FILE" >/dev/null 2>&1; then
-  pass_test "T2.B10" "status_extreme_values.json fixture persists safely without daemon error"
-else
-  fail_test "T2.B10" "status_extreme_values.json failed"
-fi
-
 # ==============================================================================
 # TIER 3: CROSS-FEATURE COMBINATIONS & STATE TRANSITIONS
 # ==============================================================================
@@ -589,16 +463,16 @@ section_header "Tier 3: Cross-Feature Combinations & State Transitions"
 
 # T3.S1: Full Listening Mode Cycle (ANC -> Ambient -> Wind -> Off -> ANC)
 run_cli noise anc >/dev/null 2>&1
-s1=$(jq -r '.noise_mode' "$STATUS_FILE")
+s1=$(get_status | jq -r '.noise_mode')
 run_cli noise ambient >/dev/null 2>&1
 run_cli ambient-level 14 >/dev/null 2>&1
-s2=$(jq -r '.noise_mode + ":" + (.ambient_sound_level|tostring)' "$STATUS_FILE")
+s2=$(get_status | jq -r '.noise_mode + ":" + (.ambient_sound_level|tostring)')
 run_cli noise wind >/dev/null 2>&1
-s3=$(jq -r '.noise_mode + ":" + (.ambient_sound_level|tostring)' "$STATUS_FILE")
+s3=$(get_status | jq -r '.noise_mode + ":" + (.ambient_sound_level|tostring)')
 run_cli noise off >/dev/null 2>&1
-s4=$(jq -r '.noise_mode' "$STATUS_FILE")
+s4=$(get_status | jq -r '.noise_mode')
 run_cli noise anc >/dev/null 2>&1
-s5=$(jq -r '.noise_mode' "$STATUS_FILE")
+s5=$(get_status | jq -r '.noise_mode')
 
 if [[ "$s1" == "anc" && "$s2" == "ambient:14" && "$s3" == "wind:1" && "$s4" == "off" && "$s5" == "anc" ]]; then
   pass_test "T3.S1" "Complete Listening Mode Cycle (ANC -> Ambient 14 -> Wind 1 -> Off -> ANC)"
@@ -606,43 +480,13 @@ else
   fail_test "T3.S1" "Listening mode cycle mismatch: s1=$s1, s2=$s2, s3=$s3, s4=$s4, s5=$s5"
 fi
 
-# T3.S2: Connection State Transition Cycle (Disconnected -> Connected -> Disconnected -> Reconnected)
-write_status_atomic "$(cat "$FIXTURES_DIR/status_disconnected.json")"
-c1=$(jq -r '.connected' "$STATUS_FILE")
-write_status_atomic "$(cat "$FIXTURES_DIR/status_connected_anc.json")"
-c2=$(jq -r '.connected' "$STATUS_FILE")
-write_status_atomic "$(cat "$FIXTURES_DIR/status_disconnected.json")"
-c3=$(jq -r '.connected' "$STATUS_FILE")
-write_status_atomic "$(cat "$FIXTURES_DIR/status_connected_ambient.json")"
-c4=$(jq -r '.connected' "$STATUS_FILE")
-
-if [[ "$c1" == "false" && "$c2" == "true" && "$c3" == "false" && "$c4" == "true" ]]; then
-  pass_test "T3.S2" "Connection State Lifecycle transitions (Disconnected <-> Connected)"
-else
-  fail_test "T3.S2" "Connection state cycle failed: c1=$c1, c2=$c2, c3=$c3, c4=$c4"
-fi
-
-# T3.S3: Battery Warning Triggers (Normal 85% -> Warning 20% -> Critical 5% -> Charging 92%)
-write_status_atomic "$(cat "$FIXTURES_DIR/status_connected_anc.json")"
-b1=$(jq -r '.battery_level' "$STATUS_FILE")
-write_status_atomic "$(cat "$FIXTURES_DIR/status_connected_low_battery.json")"
-b2=$(jq -r '.battery_level' "$STATUS_FILE")
-write_status_atomic "$(cat "$FIXTURES_DIR/status_connected_charging.json")"
-b3=$(jq -r '(.battery_level|tostring) + ":" + (.battery_charging|tostring)' "$STATUS_FILE")
-
-if [[ "$b1" -eq 85 && "$b2" -eq 8 && "$b3" == "92:true" ]]; then
-  pass_test "T3.S3" "Battery warning and charging state transitions (85% -> 8% alert -> 92% charging)"
-else
-  fail_test "T3.S3" "Battery warning transition check failed"
-fi
-
 # T3.S4: EQ Preset to Custom Mode Transition
 run_cli eq bright >/dev/null 2>&1
-eq1=$(jq -r '.eq_preset' "$STATUS_FILE")
+eq1=$(get_status | jq -r '.eq_preset')
 run_cli eq custom -2 0 3 1 -1 2 >/dev/null 2>&1
-eq2=$(jq -r '.eq_preset + ":" + (.clear_bass|tostring)' "$STATUS_FILE")
+eq2=$(get_status | jq -r '.eq_preset + ":" + (.clear_bass|tostring)')
 run_cli eq vocal >/dev/null 2>&1
-eq3=$(jq -r '.eq_preset' "$STATUS_FILE")
+eq3=$(get_status | jq -r '.eq_preset')
 
 if [[ "$eq1" == "bright" && "$eq2" == "custom:2" && "$eq3" == "vocal" ]]; then
   pass_test "T3.S4" "EQ Preset <-> Custom Mode transitions with custom band retention"
@@ -656,7 +500,7 @@ for i in {1..9}; do
   run_cli ambient-level $((i * 2)) >/dev/null 2>&1
 done
 set -e
-final_level=$(jq -r '.ambient_sound_level' "$STATUS_FILE")
+final_level=$(get_status | jq -r '.ambient_sound_level')
 if [[ "$final_level" -eq 18 ]]; then
   pass_test "T3.S5" "Sequential command stream executes and resolves to final value (step 18)"
 else
@@ -668,60 +512,18 @@ fi
 # ==============================================================================
 section_header "Tier 4: Real-World Scenarios & Stress"
 
-# T4.R1: Daemon Cold Startup & Directory Security Verification
+# T4.R1: Daemon Cold Startup & Socket Security Verification
 stop_daemon
-rm -rf "$SONY_STATE_DIR"
-rm -f "$SOCKET_FILE"
+rm -rf "$XDG_RUNTIME_DIR"
 start_daemon
-dir_perms=$(stat -c "%a" "$SONY_STATE_DIR" 2>/dev/null || stat -f "%Lp" "$SONY_STATE_DIR" 2>/dev/null)
-file_perms=$(stat -c "%a" "$STATUS_FILE" 2>/dev/null || stat -f "%Lp" "$STATUS_FILE" 2>/dev/null)
+dir_perms=$(stat -c "%a" "$XDG_RUNTIME_DIR" 2>/dev/null || stat -f "%Lp" "$XDG_RUNTIME_DIR" 2>/dev/null)
 sock_perms=$(stat -c "%a" "$SOCKET_FILE" 2>/dev/null || stat -f "%Lp" "$SOCKET_FILE" 2>/dev/null)
 
 if [[ ("$dir_perms" == "700" || "$dir_perms" == "0700") && \
-      ("$file_perms" == "600" || "$file_perms" == "0600") && \
       ("$sock_perms" == "700" || "$sock_perms" == "0700") ]]; then
-  pass_test "T4.R1" "Cold boot directory & file permissions security verified (0700/0600)"
+  pass_test "T4.R1" "Cold boot creates runtime dir and socket owner-only (0700/0700)"
 else
-  fail_test "T4.R1" "Security permissions mismatch (dir=$dir_perms, file=$file_perms, sock=$sock_perms)"
-fi
-
-# T4.R2: High-Frequency State Updates Under Concurrent Readers (Atomic Rename Verification)
-stress_errors=0
-reader_runs=0
-
-stress_reader() {
-  local count=0
-  while [[ -f "$SANDBOX_DIR/stress_active" ]]; do
-    count=$((count + 1))
-    local content
-    content=$(cat "$STATUS_FILE" 2>/dev/null || true)
-    if [[ -n "$content" ]]; then
-      if ! echo "$content" | jq -e '.schema_version == 1' >/dev/null 2>&1; then
-        echo "Torn read detected in stress reader!" >> "$SANDBOX_DIR/stress_err.log"
-      fi
-    fi
-    usleep 5000 2>/dev/null || sleep 0.01
-  done
-  echo "$count" > "$SANDBOX_DIR/reader_count"
-}
-
-touch "$SANDBOX_DIR/stress_active"
-stress_reader &
-READER_PID=$!
-
-# Execute 50 rapid atomic status writes
-for i in {1..50}; do
-  write_status_atomic "{\"schema_version\": 1, \"connected\": true, \"device_name\": \"WH-1000XM3\", \"battery_level\": $((i % 100)), \"last_updated\": $i}"
-  usleep 2000 2>/dev/null || sleep 0.005
-done
-
-rm -f "$SANDBOX_DIR/stress_active"
-wait "$READER_PID" 2>/dev/null || true
-
-if [[ ! -f "$SANDBOX_DIR/stress_err.log" ]]; then
-  pass_test "T4.R2" "50 rapid atomic rewrites under concurrent readers: 0 torn reads detected"
-else
-  fail_test "T4.R2" "Torn reads detected during atomic update stress test" "$(cat "$SANDBOX_DIR/stress_err.log")"
+  fail_test "T4.R1" "Security permissions mismatch (dir=$dir_perms, sock=$sock_perms)"
 fi
 
 # T4.R3: Daemon Crash (SIGKILL) & Auto-Restart Recovery
@@ -748,37 +550,18 @@ else
   fail_test "T4.R3" "Crash recovery failed: crash_code=$crash_cli_code, recovered_code=$recovered_cli_code"
 fi
 
-# T4.R4: FileView File Replacement Stress (100 atomic replacements without lockup)
-replacement_ok=true
-for i in {1..100}; do
-  tmp="$STATUS_FILE.tmp.$$"
-  echo "{\"schema_version\": 1, \"connected\": true, \"seq\": $i}" > "$tmp"
-  chmod 0600 "$tmp"
-  mv -f "$tmp" "$STATUS_FILE"
-  if [[ ! -f "$STATUS_FILE" ]]; then
-    replacement_ok=false
-    break
-  fi
-done
-
-if [[ "$replacement_ok" == "true" ]]; then
-  pass_test "T4.R4" "100 rapid file replacements executed with zero deadlock or file loss"
-else
-  fail_test "T4.R4" "File replacement stress encountered failure"
-fi
-
 # T4.R5: Clean Graceful Shutdown (SIGTERM)
 stop_daemon
-if [[ ! -e "$SOCKET_FILE" && ! -e "$STATUS_FILE" ]]; then
-  pass_test "T4.R5" "Graceful shutdown (SIGTERM) cleanly removes socket and status.json"
+if [[ ! -e "$SOCKET_FILE" ]]; then
+  pass_test "T4.R5" "Graceful shutdown (SIGTERM) cleanly removes the socket"
 else
-  fail_test "T4.R5" "Shutdown failed to clean up files (sock_exists=$([ -e "$SOCKET_FILE" ] && echo yes || echo no), status_exists=$([ -e "$STATUS_FILE" ] && echo yes || echo no))"
+  fail_test "T4.R5" "Shutdown left the socket behind: $SOCKET_FILE"
 fi
 
 # ==============================================================================
 # SUMMARY REPORT
 # ==============================================================================
-section_header "Simulation Test Suite Summary"
+section_header "Integration Test Suite Summary"
 
 echo "Total Tests Executed: $TOTAL_TESTS"
 echo "Tests Passed:         $PASSED_TESTS"

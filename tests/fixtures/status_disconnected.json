@@ -1,4 +1,7 @@
 {
   "schema_version": 1,
-  "connected": false
+  "connected": false,
+  "paired": true,
+  "link_state": "",
+  "link_error": ""
 }

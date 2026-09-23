@@ -59,6 +59,8 @@ void print_usage(std::ostream& os) {
     os << "Usage: sony-xm3-ctl [-s <socket>] <subcommand> [args...]\n\n"
        << "Subcommands:\n"
        << "  status                     Print the full headset state as JSON\n"
+       << "  connect                    Connect the headset over Bluetooth\n"
+       << "  disconnect                 Disconnect it (hands it back to your phone)\n"
        << "  noise <mode> [level]       anc | wind | ambient [2-" << MAX_AMBIENT_STEP << "] | off\n"
        << "  ambient-level <0-" << MAX_AMBIENT_STEP << ">       0 = ANC, 1 = wind reduction, 2+ = ambient\n"
        << "  voice-focus <on|off>       Focus on Voice (ambient step 2 and above)\n"
@@ -243,7 +245,7 @@ int main(int argc, char* argv[]) {
     }
 
     if (show_version) {
-        std::cout << "sony-xm3-ctl 0.1.0\n";
+        std::cout << "sony-xm3-ctl 0.2.0\n";
         return 0;
     }
 
@@ -260,6 +262,10 @@ int main(int argc, char* argv[]) {
 
     if (subcmd == "status") {
         return send_command(socket_path, "status\n", true);
+    }
+
+    if (subcmd == "connect" || subcmd == "disconnect") {
+        return send_command(socket_path, subcmd + "\n", false);
     }
 
     if (subcmd == "noise") {

@@ -16,6 +16,7 @@
 #include <sys/un.h>
 #include <sys/stat.h>
 #include <sys/poll.h>
+#include <fcntl.h>
 #include <thread>
 #include <chrono>
 #include <atomic>
@@ -770,115 +771,223 @@ void testMockTransportAndBluetoothManager() {
 }
 
 // ---------------------------------------------------------------------------
-// 10. StateEngine Persistence & Permissions Tests
+// 10. StateEngine and the status JSON
 // ---------------------------------------------------------------------------
 void testStateEngine() {
     TEST_CASE("StateEngine");
 
-    char tmpl[] = "/tmp/test_omasonyxm3_state_XXXXXX";
-    char* sandbox = ::mkdtemp(tmpl);
-    TEST_ASSERT(sandbox != nullptr, "mkdtemp must succeed");
-    std::filesystem::path sandboxPath(sandbox);
+    StateEngine engine;
+    TEST_ASSERT(!engine.getState().connected, "A fresh engine is disconnected until the headset answers");
 
-    {
-        StateEngine engine(sandboxPath);
-        bool ok = engine.initialize(true);
-        TEST_ASSERT(ok, "StateEngine initialize must succeed");
+    // Disconnected: only what a panel can still use.
+    engine.setBattery(60, false);
+    std::string json = engine.getStatusJson();
+    TEST_ASSERT(json.find("\"connected\":false") != std::string::npos, "disconnected payload");
+    TEST_ASSERT(json.find("\"battery_level\":60") != std::string::npos, "the last battery reading survives a disconnect");
+    TEST_ASSERT(json.find("\"paired\":false") != std::string::npos, "paired is always reported");
+    TEST_ASSERT(json.find("\"link_state\":\"\"") != std::string::npos, "link_state is always reported");
+    TEST_ASSERT(json.find("\"noise_mode\"") == std::string::npos, "settings are not reported while disconnected");
 
-        struct stat st{};
-        int rc = ::stat(engine.getStateDirectory().c_str(), &st);
-        TEST_ASSERT_EQ(rc, 0, "State directory must exist");
-        TEST_ASSERT_EQ(static_cast<int>(st.st_mode & 0777), 0700, "State directory mode must be 0700");
+    engine.setConnected(true, "WH-1000XM3");
+    engine.setNoiseMode("ambient");
+    TEST_ASSERT(engine.setAmbientLevel(14), "Ambient step 14 must be accepted");
+    engine.setEqPreset("vocal");
 
-        rc = ::stat(engine.getStateFilePath().c_str(), &st);
-        TEST_ASSERT_EQ(rc, 0, "status.json must exist");
-        TEST_ASSERT_EQ(static_cast<int>(st.st_mode & 0777), 0600, "status.json mode must be 0600");
+    // The level is the mode on this headset, so out-of-range must be refused
+    // rather than silently clamped into a different mode.
+    TEST_ASSERT(!engine.setAmbientLevel(20), "Ambient step above the reported max must be refused");
+    TEST_ASSERT(!engine.setAmbientLevel(-1), "Negative ambient step must be refused");
+    TEST_ASSERT(engine.setAmbientLevel(14), "Refused writes must leave the level usable");
 
-        // Verify JSON contents
-        std::ifstream ifs(engine.getStateFilePath());
-        std::string content((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
-        TEST_ASSERT(content.find("\"schema_version\":1") != std::string::npos, "Schema version must be 1");
-        TEST_ASSERT(content.find("\"connected\":true") != std::string::npos, "Connected must be true");
-        TEST_ASSERT(content.find("\"device_name\":\"WH-1000XM3\"") != std::string::npos, "Device name must match");
-        TEST_ASSERT(content.find("\"ambient_max_level\"") != std::string::npos, "Must contain ambient_max_level");
-        TEST_ASSERT(content.find("\"surround\"") != std::string::npos, "Must contain surround");
-        TEST_ASSERT(content.find("\"dsee_hx\"") != std::string::npos, "Must contain dsee_hx");
-        TEST_ASSERT(content.find("\"ambient_sound_level\"") != std::string::npos, "Must contain ambient_sound_level");
-        TEST_ASSERT(content.find("\"ambient_level\"") != std::string::npos, "Must contain ambient_level");
-        TEST_ASSERT(content.find("\"battery_charging\"") != std::string::npos, "Must contain battery_charging");
-        TEST_ASSERT(content.find("\"charging\"") != std::string::npos, "Must contain charging");
-
-        // Test state mutation
-        engine.setNoiseMode("ambient");
-        TEST_ASSERT(engine.setAmbientLevel(14), "Ambient step 14 must be accepted");
-        engine.setEqPreset("vocal");
-
-        // The level is the mode on this headset, so out-of-range must be refused
-        // rather than silently clamped into a different mode.
-        TEST_ASSERT(!engine.setAmbientLevel(20), "Ambient step above the reported max must be refused");
-        TEST_ASSERT(!engine.setAmbientLevel(-1), "Negative ambient step must be refused");
-        TEST_ASSERT(engine.setAmbientLevel(14), "Refused writes must leave the level usable");
-
-        std::string jsonNow = engine.getStatusJson();
-        TEST_ASSERT(jsonNow.find("\"noise_mode\":\"ambient\"") != std::string::npos, "Noise mode updated");
-        TEST_ASSERT(jsonNow.find("\"ambient_sound_level\":14") != std::string::npos, "Ambient level updated");
-        TEST_ASSERT(jsonNow.find("\"eq_preset\":\"vocal\"") != std::string::npos, "EQ preset updated");
-        TEST_ASSERT(jsonNow.find('\n') == std::string::npos, "getStatusJson must not contain newlines");
-
-        // Test concurrent readers (50 iterations)
-        std::atomic<bool> writerDone{false};
-        std::atomic<int> tornReads{0};
-
-        std::thread reader([&]() {
-            while (!writerDone.load()) {
-                std::ifstream rfs(engine.getStateFilePath());
-                std::string s((std::istreambuf_iterator<char>(rfs)), std::istreambuf_iterator<char>());
-                if (!s.empty()) {
-                    if (s.front() != '{' || s.back() != '\n') {
-                        tornReads++;
-                    }
-                }
-            }
-        });
-
-        for (int i = 0; i < 50; ++i) {
-            engine.setAmbientLevel(i % 20);
-        }
-        writerDone = true;
-        reader.join();
-        TEST_ASSERT_EQ(tornReads.load(), 0, "No torn reads under concurrent atomic writes");
-
-        // XM3-specific setters must validate their vocabulary.
-        TEST_ASSERT(engine.setSurround("concert"), "Known surround preset must be accepted");
-        TEST_ASSERT(!engine.setSurround("stadium"), "Unknown surround preset must be refused");
-        TEST_ASSERT(engine.setSoundPosition("rear-left"), "Known sound position must be accepted");
-        TEST_ASSERT(!engine.setSoundPosition("above"), "Unknown sound position must be refused");
-        TEST_ASSERT(engine.setAutoPowerOff("30min"), "Known auto power off value must be accepted");
-        TEST_ASSERT(!engine.setAutoPowerOff("7min"), "Unknown auto power off value must be refused");
-        TEST_ASSERT(engine.setConnectionMode("stable"), "Known connection mode must be accepted");
-        TEST_ASSERT(!engine.setConnectionMode("fast"), "Unknown connection mode must be refused");
-
-        // A headset reporting a larger range must widen what the engine accepts.
-        engine.setAmbientMaxLevel(20);
-        TEST_ASSERT(engine.setAmbientLevel(20), "Level 20 must be accepted once the headset reports it");
-        engine.setAmbientMaxLevel(19);
-
-        // Test disconnect
-        engine.setConnected(false);
-        std::ifstream dis_fs(engine.getStateFilePath());
-        std::string disContent((std::istreambuf_iterator<char>(dis_fs)), std::istreambuf_iterator<char>());
-        TEST_ASSERT(disContent.find("\"connected\":false") != std::string::npos, "Disconnected payload persisted");
-        TEST_ASSERT(std::filesystem::exists(engine.getStateFilePath()), "File remains on disconnect");
-
-        // Test cleanup on shutdown
-        engine.cleanup();
-        TEST_ASSERT(!std::filesystem::exists(engine.getStateFilePath()), "File unlinked on clean shutdown");
+    json = engine.getStatusJson();
+    TEST_ASSERT(json.find("\"noise_mode\":\"ambient\"") != std::string::npos, "Noise mode updated");
+    TEST_ASSERT(json.find("\"ambient_sound_level\":14") != std::string::npos, "Ambient level updated");
+    TEST_ASSERT(json.find("\"eq_preset\":\"vocal\"") != std::string::npos, "EQ preset updated");
+    TEST_ASSERT(json.find('\n') == std::string::npos, "getStatusJson must not contain newlines");
+    // One name per field, and no clock: the daemon pushes only when this text
+    // changes, so a timestamp would make every save look like a change.
+    for (const char* gone : {"\"charging\"", "\"ambient_level\"", "\"eq_bands\"", "\"dsee\"", "last_updated"}) {
+        TEST_ASSERT(json.find(gone) == std::string::npos, std::string("legacy field must be gone: ") + gone);
     }
 
-    std::error_code ec;
-    std::filesystem::remove_all(sandboxPath, ec);
+    // XM3-specific setters must validate their vocabulary.
+    TEST_ASSERT(engine.setSurround("concert"), "Known surround preset must be accepted");
+    TEST_ASSERT(!engine.setSurround("stadium"), "Unknown surround preset must be refused");
+    TEST_ASSERT(engine.setSoundPosition("rear-left"), "Known sound position must be accepted");
+    TEST_ASSERT(!engine.setSoundPosition("above"), "Unknown sound position must be refused");
+    TEST_ASSERT(engine.setAutoPowerOff("30min"), "Known auto power off value must be accepted");
+    TEST_ASSERT(!engine.setAutoPowerOff("7min"), "Unknown auto power off value must be refused");
+    TEST_ASSERT(engine.setConnectionMode("stable"), "Known connection mode must be accepted");
+    TEST_ASSERT(!engine.setConnectionMode("fast"), "Unknown connection mode must be refused");
+    TEST_ASSERT(!engine.setEqPreset("loud"), "Unknown EQ preset must be refused");
+    TEST_ASSERT(!engine.setCustomEq({0, 0, 11, 0, 0}, 0, "user1"), "Out-of-range band must be refused");
+
+    // A headset reporting a larger range must widen what the engine accepts.
+    engine.setAmbientMaxLevel(20);
+    TEST_ASSERT(engine.setAmbientLevel(20), "Level 20 must be accepted once the headset reports it");
+
+    // Names come from BlueZ and the headset: they must not break the JSON.
+    engine.setConnected(true, "Kev's \"XM3\"\\\n");
+    json = engine.getStatusJson();
+    TEST_ASSERT(json.find(R"("device_name":"Kev's \"XM3\"\\\u000a")") != std::string::npos,
+                "quotes, backslashes and control characters are escaped");
 
     TEST_PASS("StateEngine");
+}
+
+void testBatteryWarning() {
+    TEST_CASE("BatteryWarning");
+
+    int warned = 0;
+    TEST_ASSERT_EQ(batteryWarning(60, false, warned), 0, "no warning at 60%");
+    TEST_ASSERT_EQ(batteryWarning(-1, false, warned), 0, "no warning when unknown");
+    TEST_ASSERT_EQ(batteryWarning(20, false, warned), 20, "warn at 20%");
+    TEST_ASSERT_EQ(batteryWarning(20, false, warned), 0, "only once at 20% (a reconnect stays quiet)");
+    TEST_ASSERT_EQ(batteryWarning(10, false, warned), 10, "warn again at 10%");
+    TEST_ASSERT_EQ(batteryWarning(10, false, warned), 0, "only once at 10%");
+    TEST_ASSERT_EQ(batteryWarning(20, false, warned), 0, "back to 20% is not news");
+    TEST_ASSERT_EQ(batteryWarning(10, false, warned), 10, "dropping to 10% again is");
+    TEST_ASSERT_EQ(batteryWarning(10, true, warned), 0, "never while charging");
+    TEST_ASSERT_EQ(batteryWarning(10, false, warned), 10, "charging re-arms it");
+
+    int fresh = 0;
+    TEST_ASSERT_EQ(batteryWarning(10, false, fresh), 10, "connecting at 10% warns once, about 10%");
+    TEST_ASSERT_EQ(batteryWarning(10, false, fresh), 0, "and not about 20% as well");
+
+    TEST_PASS("BatteryWarning");
+}
+
+// BlueZ as the daemon sees it: a device list, a descriptor that turns
+// readable on a change, and connect/disconnect requests answered later.
+class FakeBluez : public IDeviceDiscovery {
+public:
+    FakeBluez() {
+        if (::pipe(fds) != 0) fds[0] = fds[1] = -1;
+        device.path = "/org/bluez/hci0/dev_38_18_4C_E9_47_E6";
+        device.macAddress = "38:18:4C:E9:47:E6";
+        device.name = "WH-1000XM3";
+        device.paired = true;
+        device.uuids.push_back(MDR_UUID_V1_LOWER);
+    }
+    ~FakeBluez() override { ::close(fds[0]); ::close(fds[1]); }
+
+    std::vector<BluetoothDeviceInfo> getAvailableDevices() override { return {device}; }
+    std::optional<BluetoothDeviceInfo> findSonyHeadphones(const std::string&) override {
+        lookups++;
+        // libdbus dispatches whatever arrived during a blocking lookup.
+        if (replyDuringLookup) {
+            result = replyDuringLookup;
+            replyDuringLookup.reset();
+        }
+        if (!device.paired) return std::nullopt;
+        return device;
+    }
+    int eventFd() const override { return fds[0]; }
+    bool drainEvents() override {
+        char c;
+        bool any = false;
+        while (::read(fds[0], &c, 1) == 1) any = true;
+        return any;
+    }
+    bool setDeviceConnected(const std::string& path, bool connect, std::string&) override {
+        requested = connect ? "connect " + path : "disconnect " + path;
+        return true;
+    }
+    std::optional<std::string> takeLinkResult() override {
+        auto r = std::move(result);
+        result.reset();
+        return r;
+    }
+
+    void signal() { (void)!::write(fds[1], "x", 1); }
+
+    int fds[2]{-1, -1};
+    BluetoothDeviceInfo device;
+    int lookups{0};
+    std::string requested;
+    std::optional<std::string> result;
+    std::optional<std::string> replyDuringLookup;
+};
+
+void testBluezEvents() {
+    TEST_CASE("BluezEvents");
+
+    auto fake = std::make_unique<FakeBluez>();
+    FakeBluez* bluez = fake.get();
+    ::fcntl(bluez->fds[0], F_SETFL, O_NONBLOCK);
+
+    BluetoothConfig config;
+    config.mockMode = false;  // honour BlueZ's Connected flag
+    BluetoothManager manager(config, std::make_unique<MockTransport>(), std::move(fake),
+                             std::make_unique<MockSdpResolver>());
+    int connects = 0;
+    int disconnects = 0;
+    BluetoothCallbacks callbacks;
+    callbacks.onConnected = [&]() { connects++; };
+    callbacks.onDisconnected = [&](const std::string&) { disconnects++; };
+    manager.setCallbacks(callbacks);
+
+    // Headset off: nothing to do, and nothing scheduled to check again.
+    manager.start();
+    TEST_ASSERT(manager.getState() == ConnectionState::DISCONNECTED, "waits while BlueZ has no link");
+    TEST_ASSERT(manager.isPaired(), "a paired headset is reported as such");
+    TEST_ASSERT(!manager.deadline().has_value(), "no timer runs while the headset is away");
+    TEST_ASSERT_EQ(manager.getBusFd(), bluez->fds[0], "the loop polls BlueZ's descriptor");
+    const int lookups = bluez->lookups;
+    manager.tick();
+    TEST_ASSERT_EQ(bluez->lookups, lookups, "tick does not poll BlueZ");
+    TEST_ASSERT_EQ(disconnects, 0, "never having connected is not a disconnect");
+
+    // Connect from the panel: BlueZ is asked, and the state says so.
+    std::string err;
+    TEST_ASSERT(manager.requestLink(true, err), "connect request accepted");
+    TEST_ASSERT_EQ(bluez->requested, "connect " + bluez->device.path, "BlueZ is asked to connect the device");
+    TEST_ASSERT_EQ(manager.linkState(), std::string("connecting"), "the request shows as connecting");
+    TEST_ASSERT(manager.deadline().has_value(), "a request in flight has a deadline");
+
+    // BlueZ answers OK, then reports the link: the control channel opens.
+    bluez->result = std::string();
+    bluez->device.connected = true;
+    bluez->signal();
+    manager.handleBusEvent();
+    TEST_ASSERT(manager.getState() == ConnectionState::CONNECTED, "a BlueZ signal triggers the connect at once");
+    TEST_ASSERT_EQ(connects, 1, "onConnected fires once");
+    TEST_ASSERT_EQ(manager.linkState(), std::string(), "connecting clears once the channel is open");
+
+    // Disconnect from the panel. The link drops, and BlueZ's OK arrives in the
+    // middle of the lookup its own signal triggers.
+    TEST_ASSERT(manager.requestLink(false, err), "disconnect request accepted");
+    TEST_ASSERT_EQ(bluez->requested, "disconnect " + bluez->device.path, "BlueZ is asked to disconnect");
+    TEST_ASSERT_EQ(manager.linkState(), std::string("disconnecting"), "the request shows as disconnecting");
+    bluez->replyDuringLookup = std::string();
+
+    // The link drops and BlueZ still lists it for a moment: retry with
+    // backoff, and report exactly one disconnect.
+    manager.handleSocketEvent(POLLHUP);
+    TEST_ASSERT_EQ(disconnects, 1, "the drop of an open link is a disconnect");
+    TEST_ASSERT(manager.getState() == ConnectionState::RECONNECT_BACKOFF, "retries while BlueZ has the link");
+    bluez->device.connected = false;
+    bluez->signal();
+    manager.handleBusEvent();
+    TEST_ASSERT(manager.getState() == ConnectionState::DISCONNECTED, "stops retrying once BlueZ drops the link");
+    TEST_ASSERT(!manager.deadline().has_value(), "and schedules nothing");
+    TEST_ASSERT_EQ(disconnects, 1, "still exactly one disconnect");
+    TEST_ASSERT_EQ(manager.linkState(), std::string(), "a reply read during the lookup still clears disconnecting");
+
+    // A failed connect comes back as words for the panel.
+    TEST_ASSERT(manager.requestLink(true, err), "second connect request accepted");
+    bluez->result = std::string("The headset didn't answer");
+    bluez->signal();
+    manager.handleBusEvent();
+    TEST_ASSERT_EQ(manager.linkState(), std::string(), "a failed request is no longer in flight");
+    TEST_ASSERT_EQ(manager.linkError(), std::string("The headset didn't answer"), "and says why");
+
+    // Nothing paired: connect is refused with a reason.
+    bluez->device.paired = false;
+    TEST_ASSERT(!manager.requestLink(true, err), "connect without a paired headset fails");
+    TEST_ASSERT(err.find("Pair") != std::string::npos, "and tells you to pair it");
+
+    TEST_PASS("BluezEvents");
 }
 
 // ---------------------------------------------------------------------------
@@ -1244,6 +1353,7 @@ void testCommandQueue() {
     TEST_ASSERT_EQ(sent.size(), static_cast<size_t>(1), "Only the first command may be sent before an ACK");
     TEST_ASSERT_EQ(static_cast<int>(sent[0].seq), 0, "First command uses sequence 0");
     TEST_ASSERT_EQ(q.queued(), static_cast<size_t>(2), "The other two wait");
+    TEST_ASSERT(q.deadline().has_value(), "A command in flight has an ACK deadline");
 
     // --- The ACK releases the next, and names its sequence number -----------
     q.onFrame(PacketType::ACK, 1);
@@ -1410,6 +1520,19 @@ void testDeviceFeatures() {
     TEST_ASSERT(server.handleCommandLine("eq user2 1 2 3").rfind("ERR custom eq requires", 0) == 0, "partial bands rejected");
     TEST_ASSERT_EQ(server.handleCommandLine("raw2 46 01 01"), "OK\n", "raw2 accepted");
 
+    // connect / disconnect reach the link callback, and its refusal comes back.
+    std::vector<bool> links;
+    IpcCallbacks linkCb;
+    linkCb.setLink = [&](bool connect, std::string& err) {
+        links.push_back(connect);
+        if (!connect) err = "nothing to disconnect";
+        return connect;
+    };
+    server.setCallbacks(linkCb);
+    TEST_ASSERT_EQ(server.handleCommandLine("connect"), "OK\n", "connect accepted");
+    TEST_ASSERT_EQ(server.handleCommandLine("disconnect"), "ERR nothing to disconnect\n", "a refusal is reported");
+    TEST_ASSERT(links.size() == 2 && links[0] && !links[1], "both verbs reach the callback");
+
     TEST_PASS("DeviceFeatures");
 }
 
@@ -1431,6 +1554,8 @@ int main() {
     testStringAndEnumHelpers();
     testMockTransportAndBluetoothManager();
     testStateEngine();
+    testBatteryWarning();
+    testBluezEvents();
     testIpcServer();
     testIpcSubscribeAndBroadcast();
     testIpcSocketActivation();

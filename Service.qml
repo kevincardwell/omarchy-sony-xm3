@@ -1,6 +1,11 @@
 // plugin/Service.qml
 // Reactive state and command dispatch for Sony WH-1000XM3 headphones.
 //
+// This is the plugin's service entry point: the shell creates one instance,
+// and the bar widget on every monitor reads it through
+// bar.shell.serviceFor(), so there is one socket and one copy of the state
+// however many bars there are.
+//
 // The widget runs inside the long-lived shell process, so it takes the
 // narrowest path it can to the daemon: one UNIX socket, and nothing else.
 //
@@ -31,8 +36,6 @@ import "Model.js" as Model
 
 Item {
   id: root
-
-  property var settings: ({})
 
   // ---------------------------------------------------------------------------
   // Connection to the daemon
@@ -94,8 +97,9 @@ Item {
   readonly property int ambientMaxLevel: _real.ambientMaxLevel || Model.STEP_AMBIENT_MAX_DEFAULT
   readonly property bool dseeHxActive: _real.dseeHxActive === true
   readonly property string optimizerPressure: _real.optimizerPressure || ""
-  readonly property int volumeMax: _real.volumeMax || 30
   readonly property string voiceGuidanceLanguage: _real.voiceGuidanceLanguage || ""
+  readonly property bool paired: _real.paired === true
+  readonly property string linkError: _real.linkError || ""
 
   // Settable fields: pending value if there is one, otherwise the daemon's.
   readonly property string noiseMode: _value("noiseMode")
@@ -109,7 +113,7 @@ Item {
   readonly property string soundPosition: _value("soundPosition")
   readonly property bool dseeHx: _value("dseeHx") === true
   readonly property string optimizerState: _value("optimizerState")
-  readonly property int volume: _value("volume")
+  readonly property string linkState: _value("linkState") || ""
   readonly property string ncButton: _value("ncButton")
   readonly property bool touchPanel: _value("touchPanel") === true
   readonly property bool voiceGuidance: _value("voiceGuidance") === true
@@ -310,6 +314,8 @@ Item {
 
     if (line.indexOf("ERR") === 0) {
       root.lastError = Model.elideError(line.substring(3).trim())
+      // The command was refused, so whatever it predicted will not happen.
+      root._pending = ({})
     }
     // Anything else is the "OK" that acknowledges one command.
     if (root._outstanding > 0) root._outstanding--
@@ -321,12 +327,15 @@ Item {
     var parsed = Model.parseStatus(text)
     _real = parsed
 
-    // A pending value the headset has now confirmed is no longer pending.
+    // A pending value the headset has now confirmed is no longer pending, and
+    // neither is a link request once the link is where it was asked to go
+    // (the daemon may never report "connecting" if it gets there at once).
     var next = {}
     for (var key in _pending) {
-      if (JSON.stringify(parsed[key]) !== JSON.stringify(_pending[key].value)) {
-        next[key] = _pending[key]
-      }
+      var want = _pending[key].value
+      if (JSON.stringify(parsed[key]) === JSON.stringify(want)) continue
+      if (key === "linkState" && parsed.connected === (want === "connecting")) continue
+      next[key] = _pending[key]
     }
     _pending = next
   }
@@ -441,15 +450,18 @@ Item {
     runCommand(["optimizer", "cancel"])
   }
 
-  function setVolume(level) {
-    var clamped = Model.clamp(level, 0, volumeMax, 0)
-    _setPending("volume", clamped)
-    runCommand(["volume", String(clamped)])
+  // The Bluetooth link. BlueZ can take a few seconds to page a headset, so
+  // the state says "connecting" until the daemon reports how it went.
+  function connectHeadset() {
+    if (connected || linkState !== "") return
+    _setPending("linkState", "connecting", 30000)
+    runCommand(["connect"])
   }
 
-  function playback(action) {
-    if (Model.PLAYBACK_ACTIONS.indexOf(action) === -1) return
-    runCommand(["playback", action])
+  function disconnectHeadset() {
+    if (!connected || linkState !== "") return
+    _setPending("linkState", "disconnecting", 15000)
+    runCommand(["disconnect"])
   }
 
   function setNcButton(button) {

@@ -310,10 +310,16 @@ struct HeadphoneState {
     bool voice_guidance = true;
     std::string voice_guidance_language = "";
     std::string model_name = "";        // as reported by the headset itself
-    int64_t last_updated = 0;
+
+    // The Bluetooth link, as BlueZ sees it. `paired` says whether there is a
+    // headset to connect to at all; `link_state` is "connecting" or
+    // "disconnecting" while a request made from here is under way; and
+    // `link_error` is why the last one failed, in words for the panel.
+    bool paired = false;
+    std::string link_state = "";
+    std::string link_error = "";
 
     [[nodiscard]] std::string toJson() const;
-    static HeadphoneState makeDisconnected();
 };
 
 // ---------------------------------------------------------------------------

@@ -298,7 +298,7 @@ void testCustomEqAndClearBassBoundaries() {
         bool ok = parseInboundPayload(corruptEqPayload, state);
         CHK_ASSERT(ok, tName, "Inbound parser handles corrupt EQ payload without crashing");
         // Wire byte 0xFF would naively decode to +245; it must be clamped so a
-        // corrupt frame cannot put an impossible value into status.json.
+        // corrupt frame cannot put an impossible value into the status.
         CHK_ASSERT_EQ(state.clear_bass, 10, tName, "Corrupt clear bass byte clamps to +10");
         CHK_ASSERT_EQ(state.eq_custom_bands[0], 10, tName, "Corrupt band 0 clamps to +10");
         CHK_ASSERT_EQ(state.eq_custom_bands[1], -10, tName, "Wire 0x00 decodes to -10");

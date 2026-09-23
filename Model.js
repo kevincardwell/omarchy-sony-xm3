@@ -51,13 +51,13 @@ var EQ_PRESETS = [
 var EQ_CUSTOM_SLOTS = [EQ_CUSTOM, EQ_USER1, EQ_USER2];
 var EQ_BAND_LABELS = ["400", "1k", "2.5k", "6.3k", "16k"];
 var NC_BUTTONS = ["ambient", "google-assistant", "alexa"];
-var PLAYBACK_ACTIONS = ["previous", "play", "pause", "next"];
 var OPTIMIZER_RUNNING_STATES = ["measuring-fit", "measuring-pressure", "optimizing"];
 var SURROUND_PRESETS = ["off", "outdoor", "arena", "concert", "club"];
 var SOUND_POSITIONS = ["off", "front-left", "front-right", "front", "rear-left", "rear-right"];
 // Display order; the XM3's capability reports exactly these five.
 var AUTO_POWER_OFF_VALUES = ["5min", "30min", "60min", "180min", "off"];
 var CONNECTION_MODES = ["quality", "stable"];
+var LINK_STATES = ["connecting", "disconnecting"];
 
 function defaultStatus() {
   return {
@@ -66,6 +66,11 @@ function defaultStatus() {
     schemaVersion: 0,
     schemaTooNew: false,
     connected: false,
+    // The Bluetooth link: is there a paired headset to connect to, is a
+    // connect or disconnect under way, and why did the last one fail.
+    paired: false,
+    linkState: "",
+    linkError: "",
     deviceName: "",
     batteryLevel: LEVEL_UNKNOWN,
     batteryCharging: false,
@@ -86,8 +91,6 @@ function defaultStatus() {
     firmwareVersion: "",
     optimizerState: "idle",
     optimizerPressure: "",
-    volume: LEVEL_UNKNOWN,
-    volumeMax: 30,
     ncButton: "unknown",
     touchPanel: true,
     voiceGuidance: true,
@@ -153,35 +156,35 @@ function parseStatus(raw) {
   res.ok = true;
   res.schemaVersion = version;
   res.connected = parsed.connected === true;
+  res.paired = parsed.paired === true || res.connected;
+  res.linkState = oneOf(LINK_STATES, parsed.link_state, "");
+  res.linkError = elideError(parsed.link_error);
+  res.deviceName = String(parsed.device_name || "");
+
+  // While disconnected this is the last reading, kept for the panel.
+  if (parsed.battery_level !== undefined && parsed.battery_level !== null) {
+    var bl = Number(parsed.battery_level);
+    if (!isNaN(bl) && bl >= 0) {
+      res.batteryLevel = Math.min(100, Math.round(bl));
+    }
+  }
 
   if (!res.connected) {
     return res;
   }
 
-  res.deviceName = String(parsed.device_name || "");
-
-  if (parsed.battery_level !== undefined && parsed.battery_level !== null) {
-    var bl = Number(parsed.battery_level);
-    if (!isNaN(bl) && bl >= 0) {
-      res.batteryLevel = Math.min(100, Math.round(bl));
-    } else {
-      res.batteryLevel = LEVEL_UNKNOWN;
-    }
-  }
-
-  res.batteryCharging = parsed.battery_charging === true || parsed.charging === true;
+  res.batteryCharging = parsed.battery_charging === true;
 
   res.noiseMode = oneOf([NOISE_ANC, NOISE_WIND, NOISE_AMBIENT, NOISE_OFF],
                         parsed.noise_mode, NOISE_UNKNOWN);
 
   res.ambientMaxLevel = clamp(parsed.ambient_max_level, STEP_AMBIENT_MIN, 30, STEP_AMBIENT_MAX_DEFAULT);
-  var rawAmbient = parsed.ambient_sound_level !== undefined ? parsed.ambient_sound_level : parsed.ambient_level;
-  res.ambientSoundLevel = clamp(rawAmbient, 0, res.ambientMaxLevel, 0);
+  res.ambientSoundLevel = clamp(parsed.ambient_sound_level, 0, res.ambientMaxLevel, 0);
   res.voicePassthrough = parsed.voice_passthrough === true;
 
   res.eqPreset = oneOf(EQ_PRESETS, parsed.eq_preset, EQ_OFF);
 
-  var rawBands = Array.isArray(parsed.eq_custom_bands) ? parsed.eq_custom_bands : (Array.isArray(parsed.eq_bands) ? parsed.eq_bands : []);
+  var rawBands = Array.isArray(parsed.eq_custom_bands) ? parsed.eq_custom_bands : [];
   var bands = [];
   for (var i = 0; i < 5; i++) {
     bands.push(clamp(rawBands[i], -10, 10, 0));
@@ -189,7 +192,7 @@ function parseStatus(raw) {
   res.eqCustomBands = bands;
   res.clearBass = clamp(parsed.clear_bass, -10, 10, 0);
 
-  res.dseeHx = parsed.dsee_hx === true || parsed.dsee === true;
+  res.dseeHx = parsed.dsee_hx === true;
   res.dseeHxActive = parsed.dsee_hx_active === true;
   res.surround = oneOf(SURROUND_PRESETS, parsed.surround, SURROUND_OFF);
   res.soundPosition = oneOf(SOUND_POSITIONS, parsed.sound_position, SOUND_POSITION_OFF);
@@ -200,11 +203,6 @@ function parseStatus(raw) {
 
   res.optimizerState = oneOf(["idle", "done"].concat(OPTIMIZER_RUNNING_STATES), parsed.optimizer_state, "idle");
   res.optimizerPressure = String(parsed.optimizer_pressure || "");
-
-  res.volumeMax = clamp(parsed.volume_max, 1, 100, 30);
-  if (parsed.volume !== undefined && parsed.volume !== null && Number(parsed.volume) >= 0) {
-    res.volume = clamp(parsed.volume, 0, res.volumeMax, 0);
-  }
 
   res.ncButton = oneOf(NC_BUTTONS, parsed.nc_button, "unknown");
   res.touchPanel = parsed.touch_panel !== false;
@@ -294,9 +292,27 @@ function voiceGuidanceDescription(enabled, language) {
   return language ? "Spoken prompts in " + language : "Spoken prompts on connect, battery and mode changes";
 }
 
-function volumeFraction(volume, max) {
-  if (volume === undefined || volume === null || volume < 0 || !max) return 0.0;
-  return Math.max(0.0, Math.min(1.0, volume / max));
+// The line under the headset's name in the panel header.
+function linkSummary(daemonUp, connected, linkState, codec) {
+  if (!daemonUp) return "Daemon not running";
+  if (linkState === "connecting") return "Connecting…";
+  if (linkState === "disconnecting") return "Disconnecting…";
+  if (connected) return codec ? "Connected • " + codec : "Connected";
+  return "Disconnected";
+}
+
+// What the disconnected panel says, and so what the Connect button can do.
+function disconnectedHint(daemonUp, paired, linkError, lastBattery) {
+  if (!daemonUp) {
+    return "The sony-xm3 daemon is not running. Start it with " +
+      "`systemctl --user start sony-xm3`, or run the plugin's setup.";
+  }
+  if (!paired) return "No WH-1000XM3 is paired with this computer. Pair it in the Bluetooth settings first.";
+  var text = linkError
+    ? linkError + "."
+    : "Switch the headset on and connect. It holds one device at a time, so disconnect it from your phone first.";
+  if (lastBattery >= 0) text += " Battery was " + Math.round(lastBattery) + "% when last connected.";
+  return text;
 }
 
 function stepToNoiseMode(step) {

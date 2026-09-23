@@ -21,9 +21,20 @@ Panel {
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
 
-  Service {
-    id: sony
-    settings: root.settings
+  // The shared service (Service.qml): one daemon connection for the whole
+  // shell, whichever monitor this widget is on. It is null only while the
+  // shell is still creating it, so everything that reads it checks `ready`.
+  readonly property var sony: bar && bar.shell ? bar.shell.serviceFor(moduleName) : null
+  readonly property bool ready: sony !== null
+  readonly property bool headsetConnected: ready && sony.connected
+
+  readonly property string tooltip: {
+    var name = ready && sony.deviceName ? sony.deviceName : "WH-1000XM3"
+    if (!ready || !sony.ok) return name + " (daemon not running)"
+    if (sony.linkState !== "") return name + " (" + Model.linkSummary(true, sony.connected, sony.linkState, "") + ")"
+    if (!sony.connected) return name + " (disconnected)"
+    return name + " · " + Model.noiseModeName(sony.noiseMode) + " · " + Model.formatBattery(sony.batteryLevel)
+      + "\nRight-click for the next noise mode"
   }
 
   // ---------------------------------------------------------------------------
@@ -48,14 +59,16 @@ Panel {
     eq: { values: Model.EQ_PRESETS, cols: 4 },
     surround: { values: Model.SURROUND_PRESETS, cols: 5 },
     position: { values: Model.SOUND_POSITIONS, cols: 3 },
-    playback: { values: Model.PLAYBACK_ACTIONS, cols: 4 },
     ncButton: { values: Model.NC_BUTTONS, cols: 3 },
     autoPowerOff: { values: Model.AUTO_POWER_OFF_VALUES, cols: 5 }
   })
 
-  readonly property var sectionOrder: currentTab === "sound"
-    ? ["tabs", "noise", "ambient", "voiceFocus", "connection", "eq", "surround", "position", "dsee"]
-    : ["tabs", "volume", "playback", "optimizer", "ncButton", "touchPanel", "voiceGuidance", "autoPowerOff"]
+  // Disconnected, the panel is a single Connect button.
+  readonly property var sectionOrder: !headsetConnected
+    ? ["link"]
+    : currentTab === "sound"
+      ? ["tabs", "noise", "ambient", "voiceFocus", "connection", "eq", "surround", "position", "dsee"]
+      : ["tabs", "link", "optimizer", "ncButton", "touchPanel", "voiceGuidance", "autoPowerOff"]
 
   function idx(name) { return cursorIndex[name] || 0 }
 
@@ -71,6 +84,7 @@ Panel {
   }
 
   function syncCursorToState() {
+    if (!ready) return
     var current = {
       tabs: currentTab, noise: sony.noiseMode, connection: sony.connectionMode,
       eq: sony.eqPreset, surround: sony.surround, position: sony.soundPosition,
@@ -84,6 +98,11 @@ Panel {
     cursorIndex = next
   }
 
+  function resetFocus() {
+    focusSection = sectionOrder[0]
+    syncCursorToState()
+  }
+
   function showTab(tab) {
     if (root.tabs.indexOf(tab) === -1) return
     currentTab = tab
@@ -94,16 +113,20 @@ Panel {
   onOpenedChanged: {
     if (opened) {
       cursorActive = true
-      focusSection = "tabs"
-      syncCursorToState()
+      resetFocus()
       if (panelFlick) panelFlick.contentY = 0
-      sony.refresh()
+      if (ready) sony.refresh()
       Qt.callLater(function() { keyCatcher.forceActiveFocus() })
     }
   }
 
+  // The panel changes views when the headset comes or goes.
+  onHeadsetConnectedChanged: if (opened) resetFocus()
+
   // A section is skipped by keyboard navigation when it cannot act right now.
   function sectionEnabled(name) {
+    if (!ready) return false
+    if (name === "link") return sony.ok && sony.paired && sony.linkState === ""
     if (name === "noise") return !sony.optimizerRunning
     if (name === "ambient") return sony.noiseMode === Model.NOISE_AMBIENT && !sony.optimizerRunning
     if (name === "voiceFocus") return sony.voiceFocusAvailable
@@ -126,6 +149,7 @@ Panel {
   }
 
   function moveCursor(dx, dy) {
+    if (!ready) return
     cursorActive = true
     var choice = choiceSections[focusSection]
 
@@ -149,18 +173,18 @@ Panel {
     } else if (focusSection === "ambient") {
       var lo = Model.STEP_AMBIENT_MIN
       sony.setAmbientLevel(Model.clamp(sony.ambientSoundLevel + dx, lo, sony.ambientMaxLevel, lo))
-    } else if (focusSection === "volume") {
-      sony.setVolume(Model.clamp(sony.volume + dx, 0, sony.volumeMax, 0))
     }
   }
 
   function activateCursor() {
+    if (!sectionEnabled(focusSection)) return
     var choice = choiceSections[focusSection]
     if (choice) {
       choose(focusSection, choice.values[idx(focusSection)])
       return
     }
-    if (focusSection === "voiceFocus") sony.setVoiceFocus(!sony.voicePassthrough)
+    if (focusSection === "link") toggleLink()
+    else if (focusSection === "voiceFocus") sony.setVoiceFocus(!sony.voicePassthrough)
     else if (focusSection === "dsee") sony.setDsee(!sony.dseeHx)
     else if (focusSection === "optimizer") toggleOptimizer()
     else if (focusSection === "touchPanel") sony.setTouchPanel(!sony.touchPanel)
@@ -178,7 +202,6 @@ Panel {
     else if (section === "eq") sony.setEqPreset(value)
     else if (section === "surround") sony.setSurround(value)
     else if (section === "position") sony.setSoundPosition(value)
-    else if (section === "playback") sony.playback(value)
     else if (section === "ncButton") sony.setNcButton(value)
     else if (section === "autoPowerOff") sony.setAutoPowerOff(value)
   }
@@ -188,6 +211,11 @@ Panel {
     else sony.startOptimizer()
   }
 
+  function toggleLink() {
+    if (sony.connected) sony.disconnectHeadset()
+    else sony.connectHeadset()
+  }
+
   IpcHandler {
     target: root.ipcTarget
     function open(): void { root.open() }
@@ -195,8 +223,12 @@ Panel {
     function show(): void { root.open() }
     function hide(): void { root.close() }
     function toggle(): void { root.toggle() }
-    function refresh(): string { sony.refresh(); return "ok" }
-    function cycleNoise(): string { sony.cycleNoiseMode(); return sony.noiseMode }
+    function refresh(): string { if (root.ready) root.sony.refresh(); return "ok" }
+    function cycleNoise(): string {
+      if (!root.headsetConnected) return ""
+      root.sony.cycleNoiseMode()
+      return root.sony.noiseMode
+    }
     function showTab(tab: string): string { root.showTab(tab); return root.currentTab }
   }
 
@@ -341,7 +373,7 @@ Panel {
   }
 
   // ---------------------------------------------------------------------------
-  // Bar widget button
+  // Bar widget button: headset, noise mode, battery
   // ---------------------------------------------------------------------------
   WidgetButton {
     id: button
@@ -350,41 +382,55 @@ Panel {
     labelVisible: false
     hasVisualContent: true
     fixedWidth: vertical ? -1 : (contentRow.implicitWidth + scaledHorizontalMargin * 2)
-    tooltipText: sony.connected
-      ? ((sony.deviceName || "WH-1000XM3") + " (" + Model.noiseModeName(sony.noiseMode) + ", " + Model.formatBattery(sony.batteryLevel) + ")")
-      : "Sony WH-1000XM3 (Disconnected)"
+    tooltipText: root.tooltip
+
+    readonly property color tint: button.active ? button.activeColor : button.foreground
 
     Row {
       id: contentRow
       anchors.centerIn: parent
-      spacing: Style.space(6)
+      spacing: Style.space(5)
 
       SonyIcon {
         anchors.verticalCenter: parent.verticalCenter
         iconSize: Style.space(14)
-        connected: sony.connected
-        batteryLevel: sony.batteryLevel
-        charging: sony.batteryCharging
-        color: sony.connected
-          ? (button.active ? button.activeColor : button.foreground)
+        connected: root.headsetConnected
+        batteryLevel: root.headsetConnected ? root.sony.batteryLevel : -1
+        charging: root.headsetConnected && root.sony.batteryCharging
+        color: root.headsetConnected
+          ? button.tint
           : Qt.rgba(button.foreground.r, button.foreground.g, button.foreground.b, 0.4)
+      }
+
+      // The noise mode at a glance, in the same glyphs as the panel's buttons.
+      Text {
+        anchors.verticalCenter: parent.verticalCenter
+        visible: root.headsetConnected && !button.vertical && root.sony.noiseMode !== Model.NOISE_UNKNOWN
+        text: root.headsetConnected ? Model.noiseModeIcon(root.sony.noiseMode) : ""
+        color: button.tint
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.body
+        renderType: Text.NativeRendering
       }
 
       Text {
         anchors.verticalCenter: parent.verticalCenter
+        visible: root.headsetConnected && !button.vertical
         textFormat: Text.PlainText
-        text: sony.connected ? Model.formatBattery(sony.batteryLevel) : "—"
-        color: button.active ? button.activeColor : button.foreground
+        text: root.headsetConnected ? Model.formatBattery(root.sony.batteryLevel) : ""
+        color: button.tint
         font.family: root.fontFamily
         font.pixelSize: Style.font.caption
         renderType: Text.NativeRendering
-        visible: !button.vertical
       }
     }
 
     onPressed: function(buttonCode) {
-      if (buttonCode === Qt.RightButton) sony.cycleNoiseMode()
-      else root.toggle()
+      if (buttonCode === Qt.RightButton) {
+        if (root.headsetConnected) root.sony.cycleNoiseMode()
+      } else {
+        root.toggle()
+      }
     }
   }
 
@@ -401,7 +447,7 @@ Panel {
     contentWidth: panel.fittedContentWidth(Style.space(400))
     // Tall enough for the longest view (Stable, custom EQ) without scrolling;
     // fittedContentHeight still clamps it to smaller screens.
-    contentHeight: panel.fittedContentHeight(panelColumn.implicitHeight, Style.space(1120))
+    contentHeight: panel.fittedContentHeight(body.implicitHeight, Style.space(1120))
 
     PanelKeyCatcher {
       id: keyCatcher
@@ -414,590 +460,640 @@ Panel {
         id: panelFlick
         anchors.fill: parent
         contentWidth: width
-        contentHeight: panelColumn.implicitHeight
+        contentHeight: body.implicitHeight
         clip: true
         boundsBehavior: Flickable.StopAtBounds
 
         ScrollBar.vertical: ScrollBar {
-          policy: panelColumn.implicitHeight > panelFlick.height ? ScrollBar.AsNeeded : ScrollBar.AlwaysOff
+          policy: body.implicitHeight > panelFlick.height ? ScrollBar.AsNeeded : ScrollBar.AlwaysOff
+        }
+
+        // Built once the service exists, since everything in it reads it.
+        Loader {
+          id: body
+          width: parent.width
+          active: root.ready
+          sourceComponent: panelBody
+        }
+      }
+    }
+  }
+
+  Component {
+    id: panelBody
+
+    Column {
+      width: body.width
+      spacing: Style.space(12)
+
+      // -----------------------------------------------------------------------
+      // Header. An Item rather than a Row: the battery block is pinned to the
+      // right edge, and a Row refuses horizontal anchors on its children and
+      // then lays out nothing at all.
+      // -----------------------------------------------------------------------
+      Item {
+        width: parent.width
+        height: Math.max(headerIcon.height, headerText.implicitHeight, batteryBlock.implicitHeight)
+
+        SonyIcon {
+          id: headerIcon
+          anchors.left: parent.left
+          anchors.verticalCenter: parent.verticalCenter
+          iconSize: Style.space(28)
+          connected: root.sony.connected
+          batteryLevel: root.sony.batteryLevel
+          charging: root.sony.batteryCharging
         }
 
         Column {
-          id: panelColumn
-          width: parent.width
-          spacing: Style.space(12)
+          id: headerText
+          anchors.left: headerIcon.right
+          anchors.leftMargin: Style.space(12)
+          anchors.right: batteryBlock.left
+          anchors.rightMargin: Style.space(12)
+          anchors.verticalCenter: parent.verticalCenter
+          spacing: Style.space(2)
 
-          // -------------------------------------------------------------------
-          // Header. An Item rather than a Row: the battery block is pinned to
-          // the right edge, and a Row refuses horizontal anchors on its
-          // children and then lays out nothing at all.
-          // -------------------------------------------------------------------
-          Item {
+          Text {
             width: parent.width
-            height: Math.max(headerIcon.height, headerText.implicitHeight, batteryBlock.implicitHeight)
+            textFormat: Text.PlainText
+            text: root.sony.deviceName || "WH-1000XM3"
+            color: root.foreground
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.title
+            font.bold: true
+            elide: Text.ElideRight
+          }
 
-            SonyIcon {
-              id: headerIcon
-              anchors.left: parent.left
+          Row {
+            spacing: Style.space(6)
+
+            Rectangle {
               anchors.verticalCenter: parent.verticalCenter
-              iconSize: Style.space(28)
-              connected: sony.connected
-              batteryLevel: sony.batteryLevel
-              charging: sony.batteryCharging
+              width: Style.space(7)
+              height: Style.space(7)
+              radius: width / 2
+              color: root.sony.connected ? "#2ecc71" : Qt.darker(root.foreground, 1.8)
             }
 
-            Column {
-              id: headerText
-              anchors.left: headerIcon.right
-              anchors.leftMargin: Style.space(12)
-              anchors.right: batteryBlock.left
-              anchors.rightMargin: Style.space(12)
+            Text {
               anchors.verticalCenter: parent.verticalCenter
-              spacing: Style.space(2)
+              textFormat: Text.PlainText
+              text: Model.linkSummary(root.sony.ok, root.sony.connected, root.sony.linkState, root.sony.codec)
+              color: root.muted
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+          }
+        }
 
-              Text {
-                width: parent.width
-                textFormat: Text.PlainText
-                text: sony.deviceName || "WH-1000XM3"
-                color: root.foreground
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.title
-                font.bold: true
-                elide: Text.ElideRight
-              }
+        Column {
+          id: batteryBlock
+          anchors.right: parent.right
+          anchors.verticalCenter: parent.verticalCenter
+          spacing: Style.space(2)
+          visible: root.sony.connected
 
-              Row {
-                spacing: Style.space(6)
+          Row {
+            anchors.right: parent.right
+            spacing: Style.space(4)
 
-                Rectangle {
-                  anchors.verticalCenter: parent.verticalCenter
-                  width: Style.space(7)
-                  height: Style.space(7)
-                  radius: width / 2
-                  color: sony.connected ? "#2ecc71" : Qt.darker(root.foreground, 1.8)
-                }
-
-                Text {
-                  anchors.verticalCenter: parent.verticalCenter
-                  textFormat: Text.PlainText
-                  text: sony.connected ? (sony.codec ? "Connected • " + sony.codec : "Connected") : "Disconnected"
-                  color: root.muted
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.caption
-                }
-              }
+            Text {
+              anchors.verticalCenter: parent.verticalCenter
+              text: Model.batteryIcon(root.sony.batteryLevel, root.sony.batteryCharging)
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.subtitle
             }
 
-            Column {
-              id: batteryBlock
-              anchors.right: parent.right
+            Text {
               anchors.verticalCenter: parent.verticalCenter
-              spacing: Style.space(2)
-              visible: sony.connected
-
-              Row {
-                anchors.right: parent.right
-                spacing: Style.space(4)
-
-                Text {
-                  anchors.verticalCenter: parent.verticalCenter
-                  text: Model.batteryIcon(sony.batteryLevel, sony.batteryCharging)
-                  color: root.foreground
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.subtitle
-                }
-
-                Text {
-                  anchors.verticalCenter: parent.verticalCenter
-                  textFormat: Text.PlainText
-                  text: Model.formatBattery(sony.batteryLevel)
-                  color: root.foreground
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.subtitle
-                  font.bold: true
-                }
-              }
-
-              Text {
-                anchors.right: parent.right
-                textFormat: Text.PlainText
-                visible: sony.batteryCharging
-                text: "Charging"
-                color: "#2ecc71"
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-              }
+              textFormat: Text.PlainText
+              text: Model.formatBattery(root.sony.batteryLevel)
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.subtitle
+              font.bold: true
             }
           }
 
-          ChoiceGrid {
+          Text {
+            anchors.right: parent.right
+            textFormat: Text.PlainText
+            visible: root.sony.batteryCharging
+            text: "Charging"
+            color: "#2ecc71"
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+          }
+        }
+      }
+
+      // =======================================================================
+      // DISCONNECTED: why, and a way to connect
+      // =======================================================================
+      Column {
+        width: parent.width
+        spacing: Style.space(12)
+        visible: !root.sony.connected
+
+        PanelSeparator { foreground: root.foreground }
+
+        Caption {
+          text: Model.disconnectedHint(root.sony.ok, root.sony.paired, root.sony.linkError, root.sony.batteryLevel)
+          color: root.sony.linkError ? root.foreground : root.muted
+          font.family: root.fontFamily
+        }
+
+        Button {
+          width: parent.width
+          text: root.sony.linkState === "connecting" ? "Connecting…" : "Connect"
+          fontSize: Style.font.bodySmall
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+          bordered: true
+          enabled: root.sectionEnabled("link")
+          opacity: enabled ? 1.0 : 0.5
+          hasCursor: root.cursorActive && root.focusSection === "link"
+          verticalPadding: Style.space(8)
+          onClicked: {
+            root.focusSection = "link"
+            root.toggleLink()
+          }
+        }
+      }
+
+      // =======================================================================
+      // CONNECTED
+      // =======================================================================
+      Column {
+        width: parent.width
+        spacing: Style.space(12)
+        visible: root.sony.connected
+
+        ChoiceGrid {
+          width: parent.width
+          columns: 2
+          options: [{ value: "sound", label: "Sound" }, { value: "device", label: "Device" }]
+          current: root.currentTab
+          cursor: root.cursorIn("tabs")
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+          fontSize: Style.font.bodySmall
+          onChosen: function(value) { root.choose("tabs", value) }
+        }
+
+        PanelSeparator { foreground: root.foreground }
+
+        // ---------------------------------------------------------------------
+        // SOUND
+        // ---------------------------------------------------------------------
+        Column {
+          width: parent.width
+          spacing: Style.space(12)
+          visible: root.currentTab === "sound"
+
+          // --- Noise control ------------------------------------------------
+          Column {
             width: parent.width
-            columns: 2
-            options: [{ value: "sound", label: "Sound" }, { value: "device", label: "Device" }]
-            current: root.currentTab
-            cursor: root.cursorIn("tabs")
-            foreground: root.foreground
-            fontFamily: root.fontFamily
-            fontSize: Style.font.bodySmall
-            onChosen: function(value) { root.choose("tabs", value) }
+            spacing: Style.space(8)
+
+            PanelSectionHeader {
+              text: root.sony.optimizerRunning ? "NOISE CONTROL (PAUSED WHILE OPTIMIZING)" : "NOISE CONTROL"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+            }
+
+            ChoiceGrid {
+              width: parent.width
+              columns: 4
+              options: Model.NOISE_MODES.map(function(m) {
+                return { value: m, label: Model.noiseModeButtonLabel(m), icon: Model.noiseModeIcon(m) }
+              })
+              current: root.sony.noiseMode
+              cursor: root.cursorIn("noise")
+              active: !root.sony.optimizerRunning
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              fontSize: Style.font.bodySmall
+              onChosen: function(value) { root.choose("noise", value) }
+            }
+          }
+
+          // --- Ambient level and Focus on Voice (Ambient mode only) -----------
+          Column {
+            width: parent.width
+            spacing: Style.space(6)
+            visible: root.sony.noiseMode === Model.NOISE_AMBIENT
+
+            HeaderRow {
+              width: parent.width
+              title: "AMBIENT SOUND LEVEL"
+              value: String(Math.round(ambientSlider.dragging ? ambientSlider.liveValue : root.sony.ambientSoundLevel)) + " / " + root.sony.ambientMaxLevel
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+            }
+
+            PanelSlider {
+              id: ambientSlider
+              width: parent.width
+              minimum: Model.STEP_AMBIENT_MIN
+              maximum: root.sony.ambientMaxLevel
+              step: 1
+              integer: true
+              value: Math.max(Model.STEP_AMBIENT_MIN, root.sony.ambientSoundLevel)
+              enabled: !root.sony.optimizerRunning
+              bar: root.bar
+              onReleased: function(v) {
+                root.focusSection = "ambient"
+                root.sony.setAmbientLevel(Math.round(v))
+              }
+            }
+
+            Toggle {
+              width: parent.width
+              label: "Focus on Voice"
+              description: "Prioritises speech in the ambient passthrough"
+              checked: root.sony.voicePassthrough
+              enabled: root.sony.voiceFocusAvailable
+              opacity: root.sony.voiceFocusAvailable ? 1.0 : 0.5
+              hasCursor: root.cursorActive && root.focusSection === "voiceFocus"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              onClicked: {
+                if (!root.sony.voiceFocusAvailable) return
+                root.focusSection = "voiceFocus"
+                root.sony.setVoiceFocus(!root.sony.voicePassthrough)
+              }
+            }
           }
 
           PanelSeparator { foreground: root.foreground }
 
-          // ===================================================================
-          // SOUND
-          // ===================================================================
+          // --- Bluetooth priority -------------------------------------------
           Column {
             width: parent.width
-            spacing: Style.space(12)
-            visible: root.currentTab === "sound"
+            spacing: Style.space(8)
 
-            // --- Noise control ------------------------------------------------
-            Column {
-              width: parent.width
-              spacing: Style.space(8)
-
-              PanelSectionHeader {
-                text: sony.optimizerRunning ? "NOISE CONTROL (PAUSED WHILE OPTIMIZING)" : "NOISE CONTROL"
-                foreground: root.foreground
-                fontFamily: root.fontFamily
-              }
-
-              ChoiceGrid {
-                width: parent.width
-                columns: 4
-                options: Model.NOISE_MODES.map(function(m) {
-                  return { value: m, label: Model.noiseModeButtonLabel(m), icon: Model.noiseModeIcon(m) }
-                })
-                current: sony.noiseMode
-                cursor: root.cursorIn("noise")
-                active: !sony.optimizerRunning
-                foreground: root.foreground
-                fontFamily: root.fontFamily
-                fontSize: Style.font.bodySmall
-                onChosen: function(value) { root.choose("noise", value) }
-              }
-            }
-
-            // --- Ambient level and Focus on Voice ------------------------------
-            Column {
-              width: parent.width
-              spacing: Style.space(6)
-
-              HeaderRow {
-                width: parent.width
-                opacity: sony.noiseMode === Model.NOISE_AMBIENT ? 1.0 : 0.4
-                title: "AMBIENT SOUND LEVEL"
-                value: sony.noiseMode === Model.NOISE_AMBIENT
-                  ? String(Math.round(ambientSlider.dragging ? ambientSlider.liveValue : sony.ambientSoundLevel)) + " / " + sony.ambientMaxLevel
-                  : "—"
-                foreground: root.foreground
-                fontFamily: root.fontFamily
-              }
-
-              PanelSlider {
-                id: ambientSlider
-                width: parent.width
-                opacity: sony.noiseMode === Model.NOISE_AMBIENT ? 1.0 : 0.4
-                minimum: Model.STEP_AMBIENT_MIN
-                maximum: sony.ambientMaxLevel
-                step: 1
-                integer: true
-                value: Math.max(Model.STEP_AMBIENT_MIN, sony.ambientSoundLevel)
-                enabled: sony.noiseMode === Model.NOISE_AMBIENT && !sony.optimizerRunning
-                bar: root.bar
-                onReleased: function(v) {
-                  root.focusSection = "ambient"
-                  sony.setAmbientLevel(Math.round(v))
-                }
-              }
-
-              Toggle {
-                width: parent.width
-                label: "Focus on Voice"
-                description: "Prioritises speech in the ambient passthrough"
-                checked: sony.voicePassthrough
-                enabled: sony.voiceFocusAvailable
-                opacity: sony.voiceFocusAvailable ? 1.0 : 0.5
-                hasCursor: root.cursorActive && root.focusSection === "voiceFocus"
-                foreground: root.foreground
-                fontFamily: root.fontFamily
-                onClicked: {
-                  if (!sony.voiceFocusAvailable) return
-                  root.focusSection = "voiceFocus"
-                  sony.setVoiceFocus(!sony.voicePassthrough)
-                }
-              }
-            }
-
-            PanelSeparator { foreground: root.foreground }
-
-            // --- Bluetooth priority -------------------------------------------
-            Column {
-              width: parent.width
-              spacing: Style.space(8)
-
-              PanelSectionHeader {
-                text: "BLUETOOTH PRIORITY"
-                foreground: root.foreground
-                fontFamily: root.fontFamily
-              }
-
-              ChoiceGrid {
-                width: parent.width
-                columns: 2
-                options: [{ value: "quality", label: "Sound quality" }, { value: "stable", label: "Stable" }]
-                current: sony.connectionMode
-                cursor: root.cursorIn("connection")
-                foreground: root.foreground
-                fontFamily: root.fontFamily
-                fontSize: Style.font.bodySmall
-                onChosen: function(value) { root.choose("connection", value) }
-              }
-
-              Caption {
-                text: sony.dspAvailable
-                  ? "EQ, surround and sound position are available. Audio uses SBC instead of LDAC."
-                  : "LDAC for the best sound. EQ, surround and sound position need Stable."
-                color: root.muted
-                font.family: root.fontFamily
-              }
-            }
-
-            // --- Equalizer (only usable off LDAC) -------------------------------
-            PanelSeparator { foreground: root.foreground; visible: sony.dspAvailable }
-
-            Column {
-              width: parent.width
-              spacing: Style.space(8)
-              visible: sony.dspAvailable
-
-              PanelSectionHeader {
-                text: "EQUALIZER (" + Model.eqPresetName(sony.eqPreset) + ")"
-                foreground: root.foreground
-                fontFamily: root.fontFamily
-              }
-
-              ChoiceGrid {
-                width: parent.width
-                columns: 4
-                options: Model.EQ_PRESETS.map(function(p) {
-                  return { value: p, label: Model.eqPresetButtonLabel(p) }
-                })
-                current: sony.eqPreset
-                cursor: root.cursorIn("eq")
-                foreground: root.foreground
-                fontFamily: root.fontFamily
-                onChosen: function(value) { root.choose("eq", value) }
-              }
-
-              // Band sliders for Manual, Custom 1 and Custom 2.
-              Column {
-                width: parent.width
-                spacing: Style.space(4)
-                visible: sony.customEqSelected
-
-                Repeater {
-                  model: 6
-
-                  BandSlider {
-                    required property int index
-                    width: parent.width
-                    label: index < 5 ? Model.EQ_BAND_LABELS[index] + " Hz" : "Clear Bass"
-                    value: index < 5 ? (sony.eqCustomBands[index] || 0) : sony.clearBass
-                    barRef: root.bar
-                    foreground: root.foreground
-                    fontFamily: root.fontFamily
-                    onCommitted: function(v) {
-                      var bands = sony.eqCustomBands.slice()
-                      var cb = sony.clearBass
-                      if (index < 5) bands[index] = v
-                      else cb = v
-                      sony.setEqBands(sony.eqPreset, bands, cb)
-                    }
-                  }
-                }
-              }
-            }
-
-            // --- Surround and sound position (only usable off LDAC) ------------
-            PanelSeparator { foreground: root.foreground; visible: sony.dspAvailable }
-
-            Column {
-              width: parent.width
-              spacing: Style.space(8)
-              visible: sony.dspAvailable
-
-              PanelSectionHeader {
-                text: "SURROUND (VPT)"
-                foreground: root.foreground
-                fontFamily: root.fontFamily
-              }
-
-              ChoiceGrid {
-                width: parent.width
-                columns: 5
-                options: Model.SURROUND_PRESETS.map(function(p) {
-                  return { value: p, label: Model.surroundButtonLabel(p) }
-                })
-                current: sony.surround
-                cursor: root.cursorIn("surround")
-                foreground: root.foreground
-                fontFamily: root.fontFamily
-                onChosen: function(value) { root.choose("surround", value) }
-              }
-
-              PanelSectionHeader {
-                text: "SOUND POSITION"
-                foreground: root.foreground
-                fontFamily: root.fontFamily
-              }
-
-              ChoiceGrid {
-                width: parent.width
-                columns: 3
-                options: Model.SOUND_POSITIONS.map(function(p) {
-                  return { value: p, label: Model.soundPositionName(p) }
-                })
-                current: sony.soundPosition
-                cursor: root.cursorIn("position")
-                foreground: root.foreground
-                fontFamily: root.fontFamily
-                onChosen: function(value) { root.choose("position", value) }
-              }
-            }
-
-            PanelSeparator { foreground: root.foreground }
-
-            Toggle {
-              width: parent.width
-              label: "DSEE HX"
-              description: Model.dseeDescription(sony.dseeHx, sony.dseeHxActive, sony.connectionMode)
-              checked: sony.dseeHx
-              hasCursor: root.cursorActive && root.focusSection === "dsee"
+            PanelSectionHeader {
+              text: "BLUETOOTH PRIORITY"
               foreground: root.foreground
               fontFamily: root.fontFamily
-              onClicked: {
-                root.focusSection = "dsee"
-                sony.setDsee(!sony.dseeHx)
+            }
+
+            ChoiceGrid {
+              width: parent.width
+              columns: 2
+              options: [{ value: "quality", label: "Sound quality" }, { value: "stable", label: "Stable" }]
+              current: root.sony.connectionMode
+              cursor: root.cursorIn("connection")
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              fontSize: Style.font.bodySmall
+              onChosen: function(value) { root.choose("connection", value) }
+            }
+
+            Caption {
+              text: root.sony.dspAvailable
+                ? "EQ, surround and sound position are available. Audio uses SBC instead of LDAC."
+                : "LDAC for the best sound. EQ, surround and sound position need Stable."
+              color: root.muted
+              font.family: root.fontFamily
+            }
+          }
+
+          // --- Equalizer (only usable off LDAC) -------------------------------
+          PanelSeparator { foreground: root.foreground; visible: root.sony.dspAvailable }
+
+          Column {
+            width: parent.width
+            spacing: Style.space(8)
+            visible: root.sony.dspAvailable
+
+            PanelSectionHeader {
+              text: "EQUALIZER (" + Model.eqPresetName(root.sony.eqPreset) + ")"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+            }
+
+            ChoiceGrid {
+              width: parent.width
+              columns: 4
+              options: Model.EQ_PRESETS.map(function(p) {
+                return { value: p, label: Model.eqPresetButtonLabel(p) }
+              })
+              current: root.sony.eqPreset
+              cursor: root.cursorIn("eq")
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              onChosen: function(value) { root.choose("eq", value) }
+            }
+
+            // Band sliders for Manual, Custom 1 and Custom 2.
+            Column {
+              width: parent.width
+              spacing: Style.space(4)
+              visible: root.sony.customEqSelected
+
+              Repeater {
+                model: 6
+
+                BandSlider {
+                  required property int index
+                  width: parent.width
+                  label: index < 5 ? Model.EQ_BAND_LABELS[index] + " Hz" : "Clear Bass"
+                  value: index < 5 ? (root.sony.eqCustomBands[index] || 0) : root.sony.clearBass
+                  barRef: root.bar
+                  foreground: root.foreground
+                  fontFamily: root.fontFamily
+                  onCommitted: function(v) {
+                    var bands = root.sony.eqCustomBands.slice()
+                    var cb = root.sony.clearBass
+                    if (index < 5) bands[index] = v
+                    else cb = v
+                    root.sony.setEqBands(root.sony.eqPreset, bands, cb)
+                  }
+                }
               }
             }
           }
 
-          // ===================================================================
-          // DEVICE
-          // ===================================================================
+          // --- Surround and sound position (only usable off LDAC) ------------
+          PanelSeparator { foreground: root.foreground; visible: root.sony.dspAvailable }
+
           Column {
             width: parent.width
-            spacing: Style.space(12)
-            visible: root.currentTab === "device"
+            spacing: Style.space(8)
+            visible: root.sony.dspAvailable
 
-            // --- Headset volume and playback -----------------------------------
-            Column {
+            PanelSectionHeader {
+              text: "SURROUND (VPT)"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+            }
+
+            ChoiceGrid {
               width: parent.width
-              spacing: Style.space(8)
+              columns: 5
+              options: Model.SURROUND_PRESETS.map(function(p) {
+                return { value: p, label: Model.surroundButtonLabel(p) }
+              })
+              current: root.sony.surround
+              cursor: root.cursorIn("surround")
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              onChosen: function(value) { root.choose("surround", value) }
+            }
 
-              HeaderRow {
-                width: parent.width
-                title: "HEADSET VOLUME"
-                value: sony.volume >= 0
-                  ? String(Math.round(volumeSlider.dragging ? volumeSlider.liveValue : sony.volume)) + " / " + sony.volumeMax
-                  : "—"
-                foreground: root.foreground
-                fontFamily: root.fontFamily
+            PanelSectionHeader {
+              text: "SOUND POSITION"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+            }
+
+            ChoiceGrid {
+              width: parent.width
+              columns: 3
+              options: Model.SOUND_POSITIONS.map(function(p) {
+                return { value: p, label: Model.soundPositionName(p) }
+              })
+              current: root.sony.soundPosition
+              cursor: root.cursorIn("position")
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              onChosen: function(value) { root.choose("position", value) }
+            }
+          }
+
+          PanelSeparator { foreground: root.foreground }
+
+          Toggle {
+            width: parent.width
+            label: "DSEE HX"
+            description: Model.dseeDescription(root.sony.dseeHx, root.sony.dseeHxActive, root.sony.connectionMode)
+            checked: root.sony.dseeHx
+            hasCursor: root.cursorActive && root.focusSection === "dsee"
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            onClicked: {
+              root.focusSection = "dsee"
+              root.sony.setDsee(!root.sony.dseeHx)
+            }
+          }
+        }
+
+        // ---------------------------------------------------------------------
+        // DEVICE
+        // ---------------------------------------------------------------------
+        Column {
+          width: parent.width
+          spacing: Style.space(12)
+          visible: root.currentTab === "device"
+
+          // --- Bluetooth link ------------------------------------------------
+          Column {
+            width: parent.width
+            spacing: Style.space(8)
+
+            PanelSectionHeader {
+              text: "BLUETOOTH"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+            }
+
+            Item {
+              width: parent.width
+              height: Math.max(linkText.implicitHeight, linkButton.implicitHeight)
+
+              Caption {
+                id: linkText
+                anchors.left: parent.left
+                anchors.right: linkButton.left
+                anchors.rightMargin: Style.space(12)
+                anchors.verticalCenter: parent.verticalCenter
+                width: undefined
+                text: "The headset holds one device at a time. Disconnect to hand it back to your phone."
+                color: root.muted
+                font.family: root.fontFamily
               }
 
-              PanelSlider {
-                id: volumeSlider
-                width: parent.width
-                minimum: 0
-                maximum: sony.volumeMax
-                step: 1
-                integer: true
-                value: Math.max(0, sony.volume)
-                bar: root.bar
-                onReleased: function(v) {
-                  root.focusSection = "volume"
-                  sony.setVolume(Math.round(v))
-                }
-              }
-
-              ChoiceGrid {
-                width: parent.width
-                columns: 4
-                options: [
-                  { value: "previous", label: "Prev", icon: "\u{F04AE}" },
-                  { value: "play", label: "Play", icon: "\u{F040A}" },
-                  { value: "pause", label: "Pause", icon: "\u{F03E4}" },
-                  { value: "next", label: "Next", icon: "\u{F04AD}" }
-                ]
-                current: ""
-                cursor: root.cursorIn("playback")
-                foreground: root.foreground
-                fontFamily: root.fontFamily
+              Button {
+                id: linkButton
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                width: Style.space(112)
+                text: root.sony.linkState === "disconnecting" ? "Disconnecting…" : "Disconnect"
                 fontSize: Style.font.bodySmall
-                onChosen: function(value) { root.choose("playback", value) }
-              }
-            }
-
-            PanelSeparator { foreground: root.foreground }
-
-            // --- NC Optimizer ---------------------------------------------------
-            Column {
-              width: parent.width
-              spacing: Style.space(8)
-
-              PanelSectionHeader {
-                text: "NC OPTIMIZER"
                 foreground: root.foreground
                 fontFamily: root.fontFamily
-              }
-
-              Item {
-                width: parent.width
-                height: Math.max(optimizerText.implicitHeight, optimizerButton.implicitHeight)
-
-                Caption {
-                  id: optimizerText
-                  anchors.left: parent.left
-                  anchors.right: optimizerButton.left
-                  anchors.rightMargin: Style.space(12)
-                  anchors.verticalCenter: parent.verticalCenter
-                  width: undefined
-                  text: Model.optimizerDescription(sony.optimizerState, sony.optimizerPressure)
-                  color: root.muted
-                  font.family: root.fontFamily
-                }
-
-                Button {
-                  id: optimizerButton
-                  anchors.right: parent.right
-                  anchors.verticalCenter: parent.verticalCenter
-                  width: Style.space(96)
-                  text: sony.optimizerRunning ? "Cancel" : "Optimize"
-                  fontSize: Style.font.bodySmall
-                  foreground: root.foreground
-                  fontFamily: root.fontFamily
-                  bordered: true
-                  selected: sony.optimizerRunning
-                  hasCursor: root.cursorActive && root.focusSection === "optimizer"
-                  onClicked: {
-                    root.focusSection = "optimizer"
-                    root.toggleOptimizer()
-                  }
+                bordered: true
+                enabled: root.sectionEnabled("link")
+                hasCursor: root.cursorActive && root.focusSection === "link"
+                onClicked: {
+                  root.focusSection = "link"
+                  root.toggleLink()
                 }
               }
             }
+          }
 
-            PanelSeparator { foreground: root.foreground }
+          PanelSeparator { foreground: root.foreground }
 
-            // --- NC/AMBIENT button ------------------------------------------------
-            Column {
+          // --- NC Optimizer ---------------------------------------------------
+          Column {
+            width: parent.width
+            spacing: Style.space(8)
+
+            PanelSectionHeader {
+              text: "NC OPTIMIZER"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+            }
+
+            Item {
               width: parent.width
-              spacing: Style.space(8)
-
-              PanelSectionHeader {
-                text: "NC/AMBIENT BUTTON"
-                foreground: root.foreground
-                fontFamily: root.fontFamily
-              }
-
-              ChoiceGrid {
-                width: parent.width
-                columns: 3
-                options: Model.NC_BUTTONS.map(function(b) {
-                  return { value: b, label: Model.ncButtonName(b) }
-                })
-                current: sony.ncButton
-                cursor: root.cursorIn("ncButton")
-                foreground: root.foreground
-                fontFamily: root.fontFamily
-                onChosen: function(value) { root.choose("ncButton", value) }
-              }
+              height: Math.max(optimizerText.implicitHeight, optimizerButton.implicitHeight)
 
               Caption {
-                text: Model.ncButtonDescription(sony.ncButton)
-                visible: text.length > 0
+                id: optimizerText
+                anchors.left: parent.left
+                anchors.right: optimizerButton.left
+                anchors.rightMargin: Style.space(12)
+                anchors.verticalCenter: parent.verticalCenter
+                width: undefined
+                text: Model.optimizerDescription(root.sony.optimizerState, root.sony.optimizerPressure)
                 color: root.muted
                 font.family: root.fontFamily
               }
-            }
 
-            PanelSeparator { foreground: root.foreground }
-
-            // --- Controls and prompts ---------------------------------------------
-            Column {
-              width: parent.width
-              spacing: Style.space(8)
-
-              Toggle {
-                width: parent.width
-                label: "Touch sensor control panel"
-                description: "Swipe and tap the right earcup to control playback"
-                checked: sony.touchPanel
-                hasCursor: root.cursorActive && root.focusSection === "touchPanel"
+              Button {
+                id: optimizerButton
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                width: Style.space(96)
+                text: root.sony.optimizerRunning ? "Cancel" : "Optimize"
+                fontSize: Style.font.bodySmall
                 foreground: root.foreground
                 fontFamily: root.fontFamily
+                bordered: true
+                selected: root.sony.optimizerRunning
+                hasCursor: root.cursorActive && root.focusSection === "optimizer"
                 onClicked: {
-                  root.focusSection = "touchPanel"
-                  sony.setTouchPanel(!sony.touchPanel)
-                }
-              }
-
-              Toggle {
-                width: parent.width
-                label: "Voice guidance"
-                description: Model.voiceGuidanceDescription(sony.voiceGuidance, sony.voiceGuidanceLanguage)
-                checked: sony.voiceGuidance
-                hasCursor: root.cursorActive && root.focusSection === "voiceGuidance"
-                foreground: root.foreground
-                fontFamily: root.fontFamily
-                onClicked: {
-                  root.focusSection = "voiceGuidance"
-                  sony.setVoiceGuidance(!sony.voiceGuidance)
+                  root.focusSection = "optimizer"
+                  root.toggleOptimizer()
                 }
               }
             }
+          }
 
-            PanelSeparator { foreground: root.foreground }
+          PanelSeparator { foreground: root.foreground }
 
-            // --- Auto power off -----------------------------------------------------
-            Column {
+          // --- NC/AMBIENT button ------------------------------------------------
+          Column {
+            width: parent.width
+            spacing: Style.space(8)
+
+            PanelSectionHeader {
+              text: "NC/AMBIENT BUTTON"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+            }
+
+            ChoiceGrid {
               width: parent.width
-              spacing: Style.space(8)
-
-              PanelSectionHeader {
-                text: "AUTO POWER OFF"
-                foreground: root.foreground
-                fontFamily: root.fontFamily
-              }
-
-              ChoiceGrid {
-                width: parent.width
-                columns: 5
-                options: Model.AUTO_POWER_OFF_VALUES.map(function(v) {
-                  return { value: v, label: Model.autoPowerOffLabel(v) }
-                })
-                current: sony.autoPowerOff
-                cursor: root.cursorIn("autoPowerOff")
-                foreground: root.foreground
-                fontFamily: root.fontFamily
-                onChosen: function(value) { root.choose("autoPowerOff", value) }
-              }
-
-              Caption {
-                text: "Turns the headset off after this long with nothing connected."
-                color: root.muted
-                font.family: root.fontFamily
-              }
+              columns: 3
+              options: Model.NC_BUTTONS.map(function(b) {
+                return { value: b, label: Model.ncButtonName(b) }
+              })
+              current: root.sony.ncButton
+              cursor: root.cursorIn("ncButton")
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              onChosen: function(value) { root.choose("ncButton", value) }
             }
 
             Caption {
-              text: (sony.deviceName || "WH-1000XM3") + (sony.firmwareVersion ? " · firmware " + sony.firmwareVersion : "")
-              horizontalAlignment: Text.AlignHCenter
+              text: Model.ncButtonDescription(root.sony.ncButton)
+              visible: text.length > 0
               color: root.muted
               font.family: root.fontFamily
             }
+          }
+
+          PanelSeparator { foreground: root.foreground }
+
+          // --- Controls and prompts ---------------------------------------------
+          Column {
+            width: parent.width
+            spacing: Style.space(8)
+
+            Toggle {
+              width: parent.width
+              label: "Touch sensor control panel"
+              description: "Swipe and tap the right earcup to control playback"
+              checked: root.sony.touchPanel
+              hasCursor: root.cursorActive && root.focusSection === "touchPanel"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              onClicked: {
+                root.focusSection = "touchPanel"
+                root.sony.setTouchPanel(!root.sony.touchPanel)
+              }
+            }
+
+            Toggle {
+              width: parent.width
+              label: "Voice guidance"
+              description: Model.voiceGuidanceDescription(root.sony.voiceGuidance, root.sony.voiceGuidanceLanguage)
+              checked: root.sony.voiceGuidance
+              hasCursor: root.cursorActive && root.focusSection === "voiceGuidance"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              onClicked: {
+                root.focusSection = "voiceGuidance"
+                root.sony.setVoiceGuidance(!root.sony.voiceGuidance)
+              }
+            }
+          }
+
+          PanelSeparator { foreground: root.foreground }
+
+          // --- Auto power off -----------------------------------------------------
+          Column {
+            width: parent.width
+            spacing: Style.space(8)
+
+            PanelSectionHeader {
+              text: "AUTO POWER OFF"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+            }
+
+            ChoiceGrid {
+              width: parent.width
+              columns: 5
+              options: Model.AUTO_POWER_OFF_VALUES.map(function(v) {
+                return { value: v, label: Model.autoPowerOffLabel(v) }
+              })
+              current: root.sony.autoPowerOff
+              cursor: root.cursorIn("autoPowerOff")
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              onChosen: function(value) { root.choose("autoPowerOff", value) }
+            }
+
+            Caption {
+              text: "Turns the headset off after this long with nothing connected."
+              color: root.muted
+              font.family: root.fontFamily
+            }
+          }
+
+          Caption {
+            text: (root.sony.deviceName || "WH-1000XM3") + (root.sony.firmwareVersion ? " · firmware " + root.sony.firmwareVersion : "")
+            horizontalAlignment: Text.AlignHCenter
+            color: root.muted
+            font.family: root.fontFamily
           }
         }
       }

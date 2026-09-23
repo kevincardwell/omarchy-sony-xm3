@@ -40,4 +40,3 @@ __pycache__/
 
 # Local states & sockets
 *.sock
-status.json

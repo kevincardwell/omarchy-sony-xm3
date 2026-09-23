@@ -9,7 +9,7 @@ same; the protocol layer and the feature set are not — see
 [Why this is a port, not a config change](#why-this-is-a-port-not-a-config-change).
 
 <p align="center">
-  <img src="docs/screenshots/bar.png" alt="The headphone widget in the Omarchy bar, showing 60% battery" height="36">
+  <img src="docs/screenshots/bar.png" alt="The headphone widget in the Omarchy bar: headset, noise cancelling on, 100% battery" height="36">
 </p>
 
 <table>
@@ -19,7 +19,13 @@ same; the protocol layer and the feature set are not — see
   </tr>
   <tr>
     <td valign="top"><img src="docs/screenshots/sound.png" alt="Sound tab on LDAC: noise control, ambient level, Bluetooth priority and DSEE HX" width="400"></td>
-    <td valign="top"><img src="docs/screenshots/device.png" alt="Device tab: headset volume, playback, NC optimizer, NC/AMBIENT button, touch panel, voice guidance and auto power off" width="400"></td>
+    <td valign="top"><img src="docs/screenshots/device.png" alt="Device tab: disconnect, NC optimizer, NC/AMBIENT button, touch panel, voice guidance and auto power off" width="400"></td>
+  </tr>
+  <tr>
+    <th colspan="2">Disconnected</th>
+  </tr>
+  <tr>
+    <td colspan="2" align="center"><img src="docs/screenshots/disconnected.png" alt="Disconnected: what to do, the last battery reading, and a Connect button" width="400"></td>
   </tr>
 </table>
 
@@ -44,7 +50,10 @@ checks for an adapter and a paired headset and warns you if either is missing.
 
 ## Features
 
+- 🔗 **Connect and disconnect** — from the panel or `sony-xm3-ctl connect`. The XM3 holds one device at a time, so disconnecting is how you hand it back to your phone.
 - 🔋 **Live battery & codec** — percentage, charging state, and the negotiated codec (LDAC, aptX HD, aptX, AAC, SBC).
+- 🪫 **Low-battery warnings** — a desktop notification at 20% and again at 10%.
+- 👂 **Noise mode in the bar** — its icon sits next to the battery; right-click the widget to step through ANC, Ambient and Off.
 - 🎧 **Noise control** — Noise Cancelling, Wind Noise Reduction, Ambient Sound, and Off.
 - 🔊 **Ambient sound slider** — the XM3's full passthrough range, with Focus on Voice.
 - 🎛️ **Equalizer** — all twelve presets, with band sliders (400 Hz–16 kHz + Clear Bass) for Manual, Custom 1 and Custom 2.
@@ -53,7 +62,6 @@ checks for an adapter and a paired headset and warns you if either is missing.
 - 🎪 **Surround (VPT)** — Outdoor Festival, Arena, Concert Hall, Club.
 - 🧭 **Sound position** — front, front L/R, rear L/R.
 - 🎯 **NC Optimizer** — tunes noise cancelling to your fit and the air pressure, with live progress.
-- 🔈 **Headset volume and playback** — the headset's own volume, plus play, pause and skip.
 - 🔘 **NC/AMBIENT button** — make the left-earcup button switch noise control, or talk to Google Assistant or Alexa.
 - 👆 **Touch sensor control panel** — turn the right-earcup swipe controls on or off.
 - 🗣️ **Voice guidance** — spoken prompts on or off.
@@ -62,7 +70,7 @@ checks for an adapter and a paired headset and warns you if either is missing.
 - 🗂️ **Two tabs** — *Sound* and *Device*, so the panel stays short.
 - ⌨️ **Keyboard navigation** — vim-style (`h`/`j`/`k`/`l`, `Enter`, `Esc`) in the panel.
 - 💻 **CLI (`sony-xm3-ctl`)** — everything the panel does, scriptable.
-- ⚡ **No polling** — native BlueZ RFCOMM, and the daemon pushes each state change to the panel over its socket.
+- ⚡ **No polling** — the daemon sleeps until BlueZ reports the headset, connects the moment it appears, and pushes each state change to the panel over its socket. With the headset off it does not wake at all.
 
 ---
 
@@ -110,9 +118,8 @@ back to 19 until it answers.
 │   UNIX Domain Socket ◄─────┴────────────┘              │
 │   (/run/user/$UID/sony-xm3.sock)                       │
 │                 │                                      │
-│                 │  also writes ~/.local/state/         │
-│                 │  sony-xm3/status.json (0600) for     │
-│                 │  scripts that want to read it        │
+│                 │  BlueZ signals (D-Bus) say when the  │
+│                 │  headset comes and goes              │
 │                 ▼                                      │
 │   Bluetooth RFCOMM  (MDR v1 / table 1 protocol)        │
 │                 │  (channel resolved over SDP)         │
@@ -121,8 +128,10 @@ back to 19 until it answers.
 └────────────────────────────────────────────────────────┘
 ```
 
-The widget lives inside the long-lived shell process, so it keeps that side as
-narrow as it can: it starts no processes, resolves nothing through `PATH` and
+The plugin's service (`Service.qml`) is created once per shell and shared by the
+widget on every monitor, so there is one connection to the daemon however many
+bars you have. It lives inside the long-lived shell process, so it keeps that
+side as narrow as it can: it starts no processes, resolves nothing through `PATH` and
 opens no files. It connects to the daemon's socket in this login session's
 runtime directory (`/run/user/<uid>`), refusing any other path, sends
 `subscribe`, and is then pushed every state change.
@@ -220,7 +229,8 @@ bluetoothctl
 ```
 
 This stops and removes `sony-xm3.service`, deletes the two binaries from
-`~/.local/bin/` and the state in `~/.local/state/sony-xm3/`, and runs
+`~/.local/bin/` and anything a version before 0.2.0 left in
+`~/.local/state/sony-xm3/`, and runs
 `omarchy plugin remove`, which takes the widget off the bar and deletes the
 plugin directory. Your Bluetooth pairing is left alone. If you installed from
 the marketplace, run it as
@@ -232,6 +242,8 @@ the marketplace, run it as
 
 ```bash
 sony-xm3-ctl status                    # full state as JSON
+sony-xm3-ctl connect                   # connect the headset over Bluetooth
+sony-xm3-ctl disconnect                # hand it back to your phone
 
 # Noise control
 sony-xm3-ctl noise anc                 # step 0
@@ -283,7 +295,14 @@ systemctl --user restart sony-xm3.service
 The daemon also runs offline for development:
 
 ```bash
-sony-xm3-daemon --mock --state-dir /tmp/xm3 --runtime-dir /run/user/$UID
+sony-xm3-daemon --mock --runtime-dir /tmp/xm3
+```
+
+The journal gets connects, disconnects and errors. For protocol work,
+`SONY_XM3_DEBUG=1` logs every frame sent and received:
+
+```bash
+systemctl --user set-environment SONY_XM3_DEBUG=1 && systemctl --user restart sony-xm3.service
 ```
 
 ---

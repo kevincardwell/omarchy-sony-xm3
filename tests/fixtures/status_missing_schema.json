@@ -1,4 +1,7 @@
 {
   "connected": true,
+  "paired": true,
+  "link_state": "",
+  "link_error": "",
   "device_name": "WH-1000XM3"
 }

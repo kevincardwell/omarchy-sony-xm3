@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+"""
+Lifecycle stress for the real daemon in --mock mode: start/stop cycles, signal
+blasts, concurrent IPC clients and stale-socket recovery. The daemon keeps its
+state in memory only, so everything is checked over the UNIX socket.
+"""
 import os
 import sys
 import time
@@ -37,14 +42,12 @@ def send_ipc_cmd(sock_path, cmd, timeout=2.0):
 # ---------------------------------------------------------------------------
 def test_start_stop_cycles(sbox):
     print("=== [LIFECYCLE STRESS] Test 1: 30 Start / Stop Cycles ===")
-    state_dir = os.path.join(sbox, "state_cycles")
     run_dir = os.path.join(sbox, "run_cycles")
     sock_path = os.path.join(run_dir, "sony-xm3.sock")
-    status_path = os.path.join(state_dir, "sony-xm3", "status.json")
 
     for i in range(1, 31):
         proc = subprocess.Popen(
-            [DAEMON_BIN, "--mock", "--state-dir", state_dir, "--runtime-dir", run_dir],
+            [DAEMON_BIN, "--mock", "--runtime-dir", run_dir],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True
@@ -78,17 +81,6 @@ def test_start_stop_cycles(sbox):
             proc.kill()
             return False
 
-        if not os.path.exists(status_path):
-            print(f"FAIL: Cycle {i} status.json does not exist")
-            proc.kill()
-            return False
-
-        ok_stat, mode_stat = check_mode(status_path, 0o600)
-        if not ok_stat:
-            print(f"FAIL: Cycle {i} status.json mode is {oct(mode_stat)}, expected 0600")
-            proc.kill()
-            return False
-
         # Verify IPC query
         resp = send_ipc_cmd(sock_path, "status\n")
         try:
@@ -113,11 +105,8 @@ def test_start_stop_cycles(sbox):
         if os.path.exists(sock_path):
             print(f"FAIL: Cycle {i} socket {sock_path} was not unlinked on SIGTERM")
             return False
-        if os.path.exists(status_path):
-            print(f"FAIL: Cycle {i} status.json {status_path} was not unlinked on SIGTERM")
-            return False
 
-    print("[PASS] Test 1: 30 Clean Start/Stop cycles with 0700 socket, 0600 file, and clean unlinking")
+    print("[PASS] Test 1: 30 Clean Start/Stop cycles with 0700 socket and clean unlinking")
     return True
 
 # ---------------------------------------------------------------------------
@@ -125,13 +114,11 @@ def test_start_stop_cycles(sbox):
 # ---------------------------------------------------------------------------
 def test_rapid_signals(sbox):
     print("=== [LIFECYCLE STRESS] Test 2: Rapid SIGUSR1 / SIGUSR2 Signal Blasts ===")
-    state_dir = os.path.join(sbox, "state_sig")
     run_dir = os.path.join(sbox, "run_sig")
     sock_path = os.path.join(run_dir, "sony-xm3.sock")
-    status_path = os.path.join(state_dir, "sony-xm3", "status.json")
 
     proc = subprocess.Popen(
-        [DAEMON_BIN, "--mock", "--state-dir", state_dir, "--runtime-dir", run_dir],
+        [DAEMON_BIN, "--mock", "--runtime-dir", run_dir],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True
@@ -151,26 +138,8 @@ def test_rapid_signals(sbox):
         return False
 
     stop_readers = False
-    torn_reads = 0
-    total_reads = 0
     ipc_errors = 0
     total_ipc = 0
-
-    def file_reader():
-        nonlocal torn_reads, total_reads, stop_readers
-        while not stop_readers:
-            try:
-                if os.path.exists(status_path):
-                    with open(status_path, "r") as f:
-                        txt = f.read()
-                    if txt:
-                        total_reads += 1
-                        data = json.loads(txt)
-                        if "connected" not in data or "schema_version" not in data:
-                            torn_reads += 1
-            except Exception:
-                torn_reads += 1
-            time.sleep(0.001)
 
     def ipc_reader():
         nonlocal ipc_errors, total_ipc, stop_readers
@@ -185,9 +154,7 @@ def test_rapid_signals(sbox):
                 ipc_errors += 1
             time.sleep(0.005)
 
-    reader_thread = threading.Thread(target=file_reader)
     ipc_thread = threading.Thread(target=ipc_reader)
-    reader_thread.start()
     ipc_thread.start()
 
     # Blast 100 alternating SIGUSR1 and SIGUSR2
@@ -198,30 +165,30 @@ def test_rapid_signals(sbox):
         except ProcessLookupError:
             print("FAIL: Daemon crashed during signal blasting!")
             stop_readers = True
-            reader_thread.join()
             ipc_thread.join()
             return False
         time.sleep(0.008)
 
     time.sleep(0.1)
     stop_readers = True
-    reader_thread.join()
     ipc_thread.join()
 
-    # Check daemon is still alive and responsive
+    # Check daemon is still alive and responsive. The last signal sent was
+    # SIGUSR2, and signalfd dequeues a pending SIGUSR1 before it, so the
+    # headset must end up reported as connected.
     resp = send_ipc_cmd(sock_path, "status\n")
     proc.send_signal(signal.SIGTERM)
     proc.wait(timeout=3.0)
 
-    print(f"[LIFECYCLE STRESS] Signal test results: Total file reads: {total_reads}, Torn: {torn_reads}, Total IPC: {total_ipc}, IPC errs: {ipc_errors}")
-    if torn_reads > 0:
-        print(f"FAIL: Detected {torn_reads} torn reads during signal blast")
+    print(f"[LIFECYCLE STRESS] Signal test results: Total IPC: {total_ipc}, IPC errs: {ipc_errors}")
+    if json.loads(resp or "{}").get("connected") is not True:
+        print(f"FAIL: Expected connected:true after the final SIGUSR2, got: {resp}")
         return False
     if ipc_errors > 0:
         print(f"FAIL: Detected {ipc_errors} IPC errors during signal blast")
         return False
 
-    print("[PASS] Test 2: Daemon handled 100 rapid SIGUSR1/SIGUSR2 signals with 0 torn reads and 0 IPC errors")
+    print("[PASS] Test 2: Daemon handled 100 rapid SIGUSR1/SIGUSR2 signals with 0 IPC errors, ending connected")
     return True
 
 # ---------------------------------------------------------------------------
@@ -229,12 +196,11 @@ def test_rapid_signals(sbox):
 # ---------------------------------------------------------------------------
 def test_high_concurrency_ipc(sbox):
     print("=== [LIFECYCLE STRESS] Test 3: 20 Concurrent IPC Clients (1,000 commands total) ===")
-    state_dir = os.path.join(sbox, "state_ipc")
     run_dir = os.path.join(sbox, "run_ipc")
     sock_path = os.path.join(run_dir, "sony-xm3.sock")
 
     proc = subprocess.Popen(
-        [DAEMON_BIN, "--mock", "--state-dir", state_dir, "--runtime-dir", run_dir],
+        [DAEMON_BIN, "--mock", "--runtime-dir", run_dir],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True
@@ -324,13 +290,12 @@ def test_high_concurrency_ipc(sbox):
 # ---------------------------------------------------------------------------
 def test_stale_socket_recovery(sbox):
     print("=== [LIFECYCLE STRESS] Test 4: Stale Socket Recovery After SIGKILL ===")
-    state_dir = os.path.join(sbox, "state_kill")
     run_dir = os.path.join(sbox, "run_kill")
     sock_path = os.path.join(run_dir, "sony-xm3.sock")
 
     # 1. Start daemon
     proc = subprocess.Popen(
-        [DAEMON_BIN, "--mock", "--state-dir", state_dir, "--runtime-dir", run_dir],
+        [DAEMON_BIN, "--mock", "--runtime-dir", run_dir],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True
@@ -365,7 +330,7 @@ def test_stale_socket_recovery(sbox):
 
     # 3. Start daemon again on same path without manual cleanup
     proc2 = subprocess.Popen(
-        [DAEMON_BIN, "--mock", "--state-dir", state_dir, "--runtime-dir", run_dir],
+        [DAEMON_BIN, "--mock", "--runtime-dir", run_dir],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True

@@ -5,6 +5,8 @@
 #include <array>
 #include <optional>
 #include <chrono>
+#include <algorithm>
+#include <initializer_list>
 #include <csignal>
 #include <cerrno>
 #include <cstring>
@@ -14,6 +16,7 @@
 #include <sys/types.h>
 #include <sys/poll.h>
 #include <sys/signalfd.h>
+#include <dbus/dbus.h>
 
 #include "BluetoothManager.hpp"
 #include "MDRProtocolV1.hpp"
@@ -26,7 +29,7 @@ namespace {
 using namespace omarchy::sony;
 using namespace omarchy::sony::protocol;
 
-constexpr const char* DAEMON_VERSION = "0.1.0";
+constexpr const char* DAEMON_VERSION = "0.2.0";
 constexpr const char* DEFAULT_DEVICE_NAME = "WH-1000XM3";
 
 struct DaemonOptions {
@@ -34,7 +37,6 @@ struct DaemonOptions {
     bool showVersion{false};
     bool mockMode{false};
     std::string preferredMac;
-    std::string stateDir;
     std::string runtimeDir;
 };
 
@@ -46,7 +48,6 @@ void printHelp(const char* progName) {
               << "  -v, --version            Display version information and exit\n"
               << "  -m, --mock               Run in mock simulation mode (completely offline)\n"
               << "  -d, --device <MAC>       Target specific Bluetooth MAC address\n"
-              << "      --state-dir <DIR>    Override directory for status.json\n"
               << "      --runtime-dir <DIR>  Override directory for IPC socket\n\n";
 }
 
@@ -73,13 +74,6 @@ std::optional<DaemonOptions> parseCommandLine(int argc, char* argv[]) {
                 std::cerr << "Error: --device requires a MAC address argument\n";
                 return std::nullopt;
             }
-        } else if (arg == "--state-dir") {
-            if (i + 1 < argc) {
-                opts.stateDir = argv[++i];
-            } else {
-                std::cerr << "Error: --state-dir requires a directory path\n";
-                return std::nullopt;
-            }
         } else if (arg == "--runtime-dir") {
             if (i + 1 < argc) {
                 opts.runtimeDir = argv[++i];
@@ -104,19 +98,65 @@ std::string displayName(const std::string& bluezName) {
     return name.empty() ? DEFAULT_DEVICE_NAME : name;
 }
 
-std::string resolveStateDir(const std::string& overrideDir) {
-    if (!overrideDir.empty()) {
-        return overrideDir;
+// A desktop notification (org.freedesktop.Notifications) on the session bus.
+// Fire and forget: a missing notification daemon is not the daemon's problem.
+void notifyDesktop(const char* summary, const char* body, bool critical) {
+    DBusError error;
+    dbus_error_init(&error);
+    DBusConnection* bus = dbus_bus_get(DBUS_BUS_SESSION, &error);
+    if (!bus) {
+        dbus_error_free(&error);
+        return;
     }
-    const char* xdgState = std::getenv("XDG_STATE_HOME");
-    if (xdgState && xdgState[0] != '\0') {
-        return std::string(xdgState);
+    dbus_connection_set_exit_on_disconnect(bus, FALSE);
+    DBusMessage* msg = dbus_message_new_method_call(
+        "org.freedesktop.Notifications", "/org/freedesktop/Notifications",
+        "org.freedesktop.Notifications", "Notify");
+    if (msg) {
+        const char* app = "Sony WH-1000XM3";
+        const char* icon = "audio-headphones";
+        const dbus_uint32_t replaces = 0;
+        const dbus_int32_t timeout = -1;
+        const unsigned char urgency = critical ? 2 : 1;
+        const char* urgencyKey = "urgency";
+        DBusMessageIter it, actions, hints, entry, value;
+        dbus_message_iter_init_append(msg, &it);
+        dbus_message_iter_append_basic(&it, DBUS_TYPE_STRING, &app);
+        dbus_message_iter_append_basic(&it, DBUS_TYPE_UINT32, &replaces);
+        dbus_message_iter_append_basic(&it, DBUS_TYPE_STRING, &icon);
+        dbus_message_iter_append_basic(&it, DBUS_TYPE_STRING, &summary);
+        dbus_message_iter_append_basic(&it, DBUS_TYPE_STRING, &body);
+        dbus_message_iter_open_container(&it, DBUS_TYPE_ARRAY, "s", &actions);
+        dbus_message_iter_close_container(&it, &actions);
+        dbus_message_iter_open_container(&it, DBUS_TYPE_ARRAY, "{sv}", &hints);
+        dbus_message_iter_open_container(&hints, DBUS_TYPE_DICT_ENTRY, nullptr, &entry);
+        dbus_message_iter_append_basic(&entry, DBUS_TYPE_STRING, &urgencyKey);
+        dbus_message_iter_open_container(&entry, DBUS_TYPE_VARIANT, "y", &value);
+        dbus_message_iter_append_basic(&value, DBUS_TYPE_BYTE, &urgency);
+        dbus_message_iter_close_container(&entry, &value);
+        dbus_message_iter_close_container(&hints, &entry);
+        dbus_message_iter_close_container(&it, &hints);
+        dbus_message_iter_append_basic(&it, DBUS_TYPE_INT32, &timeout);
+        dbus_message_set_no_reply(msg, TRUE);
+        dbus_connection_send(bus, msg, nullptr);
+        dbus_connection_flush(bus);
+        dbus_message_unref(msg);
     }
-    const char* home = std::getenv("HOME");
-    if (home && home[0] != '\0') {
-        return std::string(home) + "/.local/state";
+    dbus_connection_unref(bus);
+}
+
+// Milliseconds until the earliest of the given deadlines, or -1 (sleep until
+// something happens) when there are none.
+int msUntil(std::initializer_list<std::optional<std::chrono::steady_clock::time_point>> deadlines) {
+    const auto now = std::chrono::steady_clock::now();
+    long long best = -1;
+    for (const auto& due : deadlines) {
+        if (!due) continue;
+        const long long ms = std::max<long long>(
+            0, std::chrono::duration_cast<std::chrono::milliseconds>(*due - now).count() + 1);
+        if (best < 0 || ms < best) best = ms;
     }
-    return "/tmp";
+    return static_cast<int>(best);
 }
 
 std::string resolveRuntimeDir(const std::string& overrideDir) {
@@ -155,7 +195,6 @@ int main(int argc, char* argv[]) {
     }
 
     // 1. Resolve paths
-    std::string stateDir = resolveStateDir(opts.stateDir);
     std::string runtimeDir = resolveRuntimeDir(opts.runtimeDir);
 
     // 2. Setup Linux signalfd (ignoring SIGPIPE, blocking SIGINT/TERM/USR1/USR2)
@@ -180,20 +219,15 @@ int main(int argc, char* argv[]) {
     }
 
     // 3. Initialize StateEngine
-    StateEngine stateEngine(stateDir);
-    if (!stateEngine.initialize(opts.mockMode ? true : false)) {
-        std::cerr << "Fatal: Failed to initialize StateEngine at " << stateDir << "\n";
-        ::close(sigFd);
-        return 1;
-    }
+    StateEngine stateEngine;
 
     // In mock mode, ensure initial standard state
     if (opts.mockMode) {
         stateEngine.setConnected(true, DEFAULT_DEVICE_NAME);
         stateEngine.setBattery(85, false);
         stateEngine.updateNoiseMode("anc", 0, false);
-        stateEngine.updateEqPreset("off");
-        stateEngine.updateDsee(true);
+        stateEngine.setEqPreset("off");
+        stateEngine.setDsee(true);
         stateEngine.setSurround("off");
         stateEngine.setSoundPosition("off");
         stateEngine.setAutoPowerOff("180min");
@@ -208,7 +242,6 @@ int main(int argc, char* argv[]) {
             s.firmware_version = "4.5.2";
             s.codec = "SBC";
         });
-        stateEngine.save();
     }
 
     // 4. Initialize BluetoothManager
@@ -227,7 +260,6 @@ int main(int argc, char* argv[]) {
 
     if (!btManager) {
         std::cerr << "Fatal: Failed to create BluetoothManager\n";
-        stateEngine.cleanup();
         ::close(sigFd);
         return 1;
     }
@@ -242,7 +274,9 @@ int main(int argc, char* argv[]) {
     CommandQueue commands([&](const std::vector<uint8_t>& frame) {
         btManager->sendPacket(frame);
     });
-    commands.setLogging(true);
+    // Frame-by-frame traffic is for protocol work; day to day the journal
+    // gets connects, disconnects and errors.
+    commands.setLogging(verboseMdr);
 
     // Set when the user asks to reassign the NC/AMBIENT button, so that the
     // headset's "this will disconnect — proceed?" alert for exactly that change
@@ -261,7 +295,7 @@ int main(int argc, char* argv[]) {
     auto send = [&](const std::vector<uint8_t>& packet, const char* what, bool coalesce = false) {
         if (connected()) {
             commands.enqueue(packet, what, coalesce);
-        } else {
+        } else if (verboseMdr) {
             fprintf(stderr, "[DAEMON] Not connected; dropped %s\n", what);
             fflush(stderr);
         }
@@ -276,9 +310,8 @@ int main(int argc, char* argv[]) {
         if (dev.batteryLevel >= 0) {
             stateEngine.setBattery(dev.batteryLevel, false);
         }
-        stateEngine.save();
         fprintf(stderr, "[DAEMON] Headset connected (%s, battery: %d%%)\n",
-                name.c_str(), dev.batteryLevel);
+                name.c_str(), stateEngine.getState().battery_level);
         fflush(stderr);
 
         if (!opts.mockMode) {
@@ -314,7 +347,6 @@ int main(int argc, char* argv[]) {
         commands.reset();
         streamFramer.reset();
         stateEngine.setConnected(false);
-        stateEngine.save();
         fprintf(stderr, "[DAEMON] Headset disconnected: %s\n", reason.c_str());
         fflush(stderr);
     };
@@ -337,7 +369,7 @@ int main(int argc, char* argv[]) {
             }
 
             const auto& unpacked = *unpackedOpt;
-            if (unpacked.type == PacketType::ACK) {
+            if (verboseMdr && unpacked.type == PacketType::ACK) {
                 // Logged before onFrame(): the ACK releases the next command,
                 // and its TX line should read as a consequence, not a cause.
                 fprintf(stderr, "[MDR] RX ACK seq=%u\n", static_cast<unsigned>(unpacked.seq));
@@ -352,19 +384,21 @@ int main(int argc, char* argv[]) {
                 auto ack = serializeACK(unpacked.seq);
                 btManager->sendPacket(ack);
 
-                fprintf(stderr, "[DAEMON] RX%s payload (cmd=0x%02x, size=%zu): ",
-                        unpacked.type == PacketType::DATA_MDR_NO2 ? " T2" : "",
-                        unpacked.payload.empty() ? 0 : unpacked.payload[0], unpacked.payload.size());
-                for (uint8_t b : unpacked.payload) {
-                    fprintf(stderr, "%02x ", b);
+                if (verboseMdr) {
+                    fprintf(stderr, "[DAEMON] RX%s payload (cmd=0x%02x, size=%zu): ",
+                            unpacked.type == PacketType::DATA_MDR_NO2 ? " T2" : "",
+                            unpacked.payload.empty() ? 0 : unpacked.payload[0], unpacked.payload.size());
+                    for (uint8_t b : unpacked.payload) {
+                        fprintf(stderr, "%02x ", b);
+                    }
+                    fprintf(stderr, "\n");
+                    fflush(stderr);
                 }
-                fprintf(stderr, "\n");
-                fflush(stderr);
 
                 // Update state from payload
                 bool changed = unpacked.type == PacketType::DATA_MDR_NO2
-                    ? protocol::parseInboundPayloadT2(unpacked.payload, stateEngine.getStateUnsafe())
-                    : protocol::parseInboundPayload(unpacked.payload, stateEngine.getStateUnsafe());
+                    ? protocol::parseInboundPayloadT2(unpacked.payload, stateEngine.state())
+                    : protocol::parseInboundPayload(unpacked.payload, stateEngine.state());
                 // A "proceed?" alert: [0x99, FIXED_MESSAGE, message, POSITIVE_NEGATIVE]
                 if (unpacked.type == PacketType::DATA_MDR && unpacked.payload.size() >= 4 &&
                     unpacked.payload[0] == static_cast<uint8_t>(Command::ALERT_NTFY_PARAM) &&
@@ -378,17 +412,8 @@ int main(int argc, char* argv[]) {
                     send(serializeAlertReply(message, proceed), "alert reply");
                 }
 
-                if (changed) {
-                    stateEngine.save();
-                    const auto snapshot = stateEngine.getState();
-                    if (snapshot.noise_mode == "ambient") {
-                        lastAmbientStep = snapshot.ambient_sound_level;
-                    }
-                    fprintf(stderr, "[DAEMON] Updated state: mode=%s, level=%d, voice=%d\n",
-                            snapshot.noise_mode.c_str(),
-                            snapshot.ambient_sound_level,
-                            snapshot.voice_passthrough ? 1 : 0);
-                    fflush(stderr);
+                if (changed && stateEngine.getState().noise_mode == "ambient") {
+                    lastAmbientStep = stateEngine.getState().ambient_sound_level;
                 }
             }
         }
@@ -429,11 +454,6 @@ int main(int argc, char* argv[]) {
         }
 
         stateEngine.updateNoiseMode(noiseModeToString(mode), step, voiceFocus);
-        stateEngine.save();
-
-        fprintf(stderr, "[DAEMON] Noise mode: %s (step %u)\n",
-                noiseModeToString(mode).c_str(), (unsigned)step);
-        fflush(stderr);
 
         if (mode == NoiseMode::OFF) {
             send(serializeNcAsm(false, step, false), "noise off", true);
@@ -447,16 +467,12 @@ int main(int argc, char* argv[]) {
         if (level >= kMinAmbientStep) {
             lastAmbientStep = level;
         }
-        stateEngine.updateAmbientLevel(level);
-        stateEngine.save();
-        fprintf(stderr, "[DAEMON] Ambient step: %u\n", (unsigned)level);
-        fflush(stderr);
+        stateEngine.setAmbientLevel(level);
         send(serializeAmbientLevel(level, voiceFocus), "ambient level", true);
         return true;
     };
     ipcCb.setVoiceFocus = [&](bool enabled, std::string& /*err*/) {
         stateEngine.setVoicePassthrough(enabled);
-        stateEngine.save();
         const auto snapshot = stateEngine.getState();
         // Focus on Voice rides along with the NC/ASM command, so re-send the
         // current step rather than inventing a separate message for it.
@@ -479,41 +495,35 @@ int main(int argc, char* argv[]) {
 
     ipcCb.setEqPreset = [&](EqPreset preset, std::string& err) {
         if (dspBlockedByLdac("EQ", err)) return false;
-        stateEngine.updateEqPreset(eqPresetToString(preset));
-        stateEngine.save();
+        stateEngine.setEqPreset(eqPresetToString(preset));
         send(serializeEqPreset(preset), "eq preset");
         return true;
     };
     ipcCb.setCustomEq = [&](EqPreset slot, const std::array<int, 5>& bands, int clearBass, std::string& err) {
         if (dspBlockedByLdac("EQ", err)) return false;
-        stateEngine.updateCustomEq(bands, clearBass, eqPresetToString(slot));
-        stateEngine.save();
+        stateEngine.setCustomEq(bands, clearBass, eqPresetToString(slot));
         send(serializeCustomEq(bands, clearBass, 0, slot), "custom eq", true);
         return true;
     };
     ipcCb.setDsee = [&](bool enabled, std::string& /*err*/) {
-        stateEngine.updateDsee(enabled);
-        stateEngine.save();
+        stateEngine.setDsee(enabled);
         send(serializeDsee(enabled), "dsee hx");
         return true;
     };
     ipcCb.setSurround = [&](SurroundPreset preset, std::string& err) {
         if (dspBlockedByLdac("Surround", err)) return false;
         stateEngine.setSurround(surroundToString(preset));
-        stateEngine.save();
         send(serializeSurround(preset), "surround");
         return true;
     };
     ipcCb.setSoundPosition = [&](SoundPosition position, std::string& err) {
         if (dspBlockedByLdac("Sound position", err)) return false;
         stateEngine.setSoundPosition(soundPositionToString(position));
-        stateEngine.save();
         send(serializeSoundPosition(position), "sound position");
         return true;
     };
     ipcCb.setAutoPowerOff = [&](AutoPowerOff timer, std::string& /*err*/) {
         stateEngine.setAutoPowerOff(autoPowerOffToString(timer));
-        stateEngine.save();
         send(serializeAutoPowerOff(timer), "auto power off");
         return true;
     };
@@ -523,7 +533,6 @@ int main(int argc, char* argv[]) {
             // A real headset renegotiates and announces the codec itself.
             stateEngine.setCodec(mode == ConnectionMode::SOUND_QUALITY ? "LDAC" : "SBC");
         }
-        stateEngine.save();
         send(serializeConnectionMode(mode), "connection mode");
         send(serializeQueryEq(), "re-query eq after mode change");
         send(serializeQuerySurround(), "re-query surround after mode change");
@@ -565,21 +574,21 @@ int main(int argc, char* argv[]) {
         send(serializeVoiceGuidance(enabled), "voice guidance");
         return true;
     };
+    ipcCb.setLink = [&](bool connect, std::string& err) {
+        return btManager->requestLink(connect, err);
+    };
     ipcCb.sendPacket = [&](const std::vector<uint8_t>& packet) {
         send(packet, "raw packet");
         return true;
     };
     ipcCb.onTestSetBattery = [&](int level, bool charging) {
         stateEngine.setBattery(level, charging);
-        stateEngine.save();
     };
     ipcCb.onTestDisconnect = [&]() {
         stateEngine.setConnected(false);
-        stateEngine.save();
     };
     ipcCb.onTestReconnect = [&]() {
         stateEngine.setConnected(true);
-        stateEngine.save();
     };
 
     ipcServer.setCallbacks(std::move(ipcCb));
@@ -587,7 +596,6 @@ int main(int argc, char* argv[]) {
     if (!ipcServer.start()) {
         std::cerr << "Fatal: Failed to start IPC server at " << socketPath << "\n";
         btManager->stop();
-        stateEngine.cleanup();
         ::close(sigFd);
         return 1;
     }
@@ -600,8 +608,14 @@ int main(int argc, char* argv[]) {
     }
 
     // 7. Unified Event Loop
+    //
+    // It sleeps until a descriptor has something or a deadline falls due: a
+    // command waiting for its ACK, a connect attempt, a retry. With the
+    // headset away and no client talking, nothing is due and it sleeps until
+    // BlueZ reports a change.
     bool running = true;
     std::string lastPublishedStatus;
+    int batteryWarned = 0;
 
     while (running) {
         std::vector<struct pollfd> pfds;
@@ -609,7 +623,7 @@ int main(int argc, char* argv[]) {
         // Entry 0: Signal descriptor
         pfds.push_back({sigFd, POLLIN, 0});
 
-        // Entry 1 (Optional): Bluetooth transport descriptor
+        // Bluetooth transport descriptor
         int btFd = btManager->getPollFd();
         short btEvents = btManager->getPollEvents();
         int btIndex = -1;
@@ -618,12 +632,20 @@ int main(int argc, char* argv[]) {
             pfds.push_back({btFd, btEvents, 0});
         }
 
-        // Entries 2+: IPC listen socket and connected client sockets
+        // BlueZ signals on the system bus
+        int busFd = btManager->getBusFd();
+        int busIndex = -1;
+        if (busFd >= 0) {
+            busIndex = static_cast<int>(pfds.size());
+            pfds.push_back({busFd, POLLIN, 0});
+        }
+
+        // IPC listen socket and connected client sockets
         size_t ipcStartIndex = pfds.size();
         ipcServer.appendPollFds(pfds);
 
-        // Poll with 100ms timeout for periodic BluetoothManager tick
-        int pollRc = ::poll(pfds.data(), static_cast<nfds_t>(pfds.size()), 100);
+        const int timeoutMs = msUntil({btManager->deadline(), commands.deadline()});
+        int pollRc = ::poll(pfds.data(), static_cast<nfds_t>(pfds.size()), timeoutMs);
         if (pollRc < 0) {
             if (errno == EINTR) {
                 continue;
@@ -635,22 +657,20 @@ int main(int argc, char* argv[]) {
         // Check Signal Descriptor
         if (pfds[0].revents & POLLIN) {
             struct signalfd_siginfo fdsi{};
-            ssize_t s = ::read(sigFd, &fdsi, sizeof(fdsi));
-            if (s == sizeof(fdsi)) {
+            ssize_t sz = ::read(sigFd, &fdsi, sizeof(fdsi));
+            if (sz == sizeof(fdsi)) {
                 if (fdsi.ssi_signo == SIGINT || fdsi.ssi_signo == SIGTERM) {
                     running = false;
                     break;
                 } else if (fdsi.ssi_signo == SIGUSR1) {
                     // Simulated disconnect
                     stateEngine.setConnected(false);
-                    stateEngine.save();
                     if (!opts.mockMode) {
                         btManager->disconnect();
                     }
                 } else if (fdsi.ssi_signo == SIGUSR2) {
                     // Simulated reconnect
                     stateEngine.setConnected(true);
-                    stateEngine.save();
                     if (!opts.mockMode) {
                         btManager->start();
                     }
@@ -658,25 +678,40 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        // Check Bluetooth Transport Descriptor
         if (btIndex >= 0 && (pfds[btIndex].revents != 0)) {
             btManager->handleSocketEvent(pfds[btIndex].revents);
         }
 
-        // Check IPC Descriptors
+        if (busIndex >= 0 && pfds[busIndex].revents != 0) {
+            btManager->handleBusEvent();
+        }
+
         for (size_t i = ipcStartIndex; i < pfds.size(); ++i) {
             if (pfds[i].revents != 0) {
                 ipcServer.handleSocketEvent(pfds[i].fd, pfds[i].revents);
             }
         }
 
-        // Subsystem periodic tick (timeouts and reconnect backoff)
         btManager->tick();
         commands.tick();
 
-        // Push the state to subscribed clients whenever it changes, so the bar
-        // widget never has to read the state file. The comparison runs at most
-        // once per 100 ms poll cycle and only sends when something differs.
+        stateEngine.modifyState([&](HeadphoneState& s) {
+            s.paired = opts.mockMode || btManager->isPaired();
+            s.link_state = btManager->linkState();
+            s.link_error = btManager->linkError();
+        });
+
+        const auto& state = stateEngine.getState();
+        if (state.connected && !opts.mockMode) {
+            if (const int threshold = batteryWarning(state.battery_level, state.battery_charging, batteryWarned)) {
+                const std::string body = std::to_string(state.battery_level) + "% left" +
+                    (threshold == 10 ? ". Charge it soon." : ".");
+                notifyDesktop((displayName(state.device_name) + " battery low").c_str(), body.c_str(),
+                              threshold == 10);
+            }
+        }
+
+        // Push the state to subscribed clients when it has actually changed.
         if (ipcServer.getSubscriberCount() > 0) {
             std::string statusJson = stateEngine.getStatusJson();
             if (statusJson != lastPublishedStatus) {
@@ -696,7 +731,6 @@ int main(int argc, char* argv[]) {
 
     btManager->stop();
     ipcServer.stop();
-    stateEngine.cleanup();
 
     if (mockPeerFd >= 0) {
         ::close(mockPeerFd);

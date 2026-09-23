@@ -3,9 +3,11 @@
 Adversarial Stress Harness for Milestone 2 Iteration 2
 OMARCHY-SONY Empirical Challenger
 
+Runs the real daemon in --mock mode; state is in memory, read over the socket.
+
 Tests:
 1. Rapid Status Queries & Concurrent Socket Reads (Compact JSON verification)
-2. StateEngine Atomic File Updates Under Continuous Concurrent Readers (Mode 0600 check)
+2. Status Queries Under Concurrent Mutating Clients
 3. Abrupt Client Disconnections & Pipelining Stress (UAF / crash check)
 4. Clean Shutdown (SIGTERM, SIGINT) & Stale Socket Recovery
 5. Pipelined Mixed Valid/Invalid Commands & Sequential Synchronization
@@ -20,31 +22,22 @@ import tempfile
 import subprocess
 import threading
 import json
-import stat
 import random
 
 # Resolved relative to the repository so the suite is not tied to one checkout.
 DAEMON_BIN = os.environ.get("DAEMON_BIN", os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "build", "daemon", "sony-xm3-daemon"))
 
-def check_mode(path, expected_mode):
-    st = os.stat(path)
-    actual_mode = stat.S_IMODE(st.st_mode)
-    return actual_mode == expected_mode, actual_mode
-
 class DaemonContext:
     def __init__(self, sbox, name):
         self.sbox = sbox
-        self.state_dir = os.path.join(sbox, f"state_{name}")
         self.run_dir = os.path.join(sbox, f"run_{name}")
         self.sock_path = os.path.join(self.run_dir, "sony-xm3.sock")
-        self.status_path = os.path.join(self.state_dir, "sony-xm3", "status.json")
         self.proc = None
 
     def start(self):
-        os.makedirs(self.state_dir, exist_ok=True)
         os.makedirs(self.run_dir, exist_ok=True)
         self.proc = subprocess.Popen(
-            [DAEMON_BIN, "--mock", "--state-dir", self.state_dir, "--runtime-dir", self.run_dir],
+            [DAEMON_BIN, "--mock", "--runtime-dir", self.run_dir],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True
@@ -144,8 +137,8 @@ def test_rapid_concurrent_status(sbox):
                     errors.append(f"Worker {worker_id} query {i}: connected is not True")
                 if not isinstance(data.get("battery_level"), int):
                     errors.append(f"Worker {worker_id} query {i}: battery_level is not int")
-                if not isinstance(data.get("eq_bands"), list) or len(data["eq_bands"]) != 5:
-                    errors.append(f"Worker {worker_id} query {i}: eq_bands invalid")
+                if not isinstance(data.get("eq_custom_bands"), list) or len(data["eq_custom_bands"]) != 5:
+                    errors.append(f"Worker {worker_id} query {i}: eq_custom_bands invalid")
             except Exception as e:
                 errors.append(f"Worker {worker_id} query {i}: Exception {e}")
 
@@ -176,52 +169,30 @@ def test_rapid_concurrent_status(sbox):
     return True
 
 # ---------------------------------------------------------------------------
-# Test 2: StateEngine Atomic File Updates Under Continuous Readers
+# Test 2: Status Queries Under Concurrent Mutating Clients
 # ---------------------------------------------------------------------------
-def test_atomic_file_updates_under_load(sbox):
-    print("=== [CHALLENGE 2] Atomic Updates & Mode 0600 Under Continuous Readers ===")
-    ctx = DaemonContext(sbox, "atomic_stress")
+def test_status_under_concurrent_mutation(sbox):
+    print("=== [CHALLENGE 2] Status Queries Under Concurrent Mutating Clients ===")
+    ctx = DaemonContext(sbox, "mutation_stress")
     ctx.start()
 
     stop_flag = False
     read_errors = []
-    torn_reads = 0
-    empty_reads = 0
-    bad_permissions = 0
+    bad_reads = 0
     total_reads = 0
     total_mutations = 0
 
-    def file_reader():
-        nonlocal torn_reads, empty_reads, bad_permissions, total_reads
+    def status_reader():
+        nonlocal bad_reads, total_reads
         while not stop_flag:
             try:
-                if os.path.exists(ctx.status_path):
-                    # Check file mode
-                    st = os.stat(ctx.status_path)
-                    mode = stat.S_IMODE(st.st_mode)
-                    if mode != 0o600:
-                        bad_permissions += 1
-
-                    # Check parent dir mode
-                    parent_st = os.stat(os.path.dirname(ctx.status_path))
-                    parent_mode = stat.S_IMODE(parent_st.st_mode)
-                    if parent_mode != 0o700:
-                        bad_permissions += 1
-
-                    with open(ctx.status_path, "r") as f:
-                        content = f.read()
-
-                    if len(content) == 0:
-                        empty_reads += 1
-                        continue
-
-                    total_reads += 1
-                    # Parse JSON
-                    data = json.loads(content)
-                    if "schema_version" not in data or "connected" not in data:
-                        torn_reads += 1
-            except Exception as e:
-                torn_reads += 1
+                resp = send_cmd(ctx.sock_path, "status\n", timeout=2.0)
+                total_reads += 1
+                data = json.loads(resp)
+                if data.get("schema_version") != 1 or "connected" not in data:
+                    bad_reads += 1
+            except Exception:
+                bad_reads += 1
             time.sleep(0.0005)
 
     def mutator(worker_id, count):
@@ -254,7 +225,7 @@ def test_atomic_file_updates_under_load(sbox):
                 read_errors.append(f"Mutator {worker_id} exception: {e}")
 
     # Launch 6 continuous reader threads
-    reader_threads = [threading.Thread(target=file_reader) for _ in range(6)]
+    reader_threads = [threading.Thread(target=status_reader) for _ in range(6)]
     for rt in reader_threads:
         rt.start()
 
@@ -274,26 +245,22 @@ def test_atomic_file_updates_under_load(sbox):
 
     ret = ctx.stop_term()
 
-    print(f"Total mutations: {total_mutations}, Total file reads: {total_reads}")
-    print(f"Empty reads: {empty_reads}, Torn reads: {torn_reads}, Bad permissions: {bad_permissions}")
+    print(f"Total mutations: {total_mutations}, Total status reads: {total_reads}, Bad reads: {bad_reads}")
 
     if read_errors:
         print(f"FAILED: Mutator errors: {read_errors[:5]}")
         return False
-    if empty_reads > 0:
-        print(f"FAILED: Detected {empty_reads} empty reads (atomicity violated)!")
+    if ret != 0:
+        print(f"FAILED: Daemon exited with code {ret}")
         return False
-    if torn_reads > 0:
-        print(f"FAILED: Detected {torn_reads} torn reads!")
-        return False
-    if bad_permissions > 0:
-        print(f"FAILED: Detected {bad_permissions} permission violations!")
+    if bad_reads > 0:
+        print(f"FAILED: Detected {bad_reads} failed or malformed status reads!")
         return False
     if total_reads < 500:
         print(f"FAILED: Not enough reads completed ({total_reads})")
         return False
 
-    print("[PASS] Challenge 2: 400 mutations under continuous readers achieved 0 torn reads and 100% 0600 mode.")
+    print("[PASS] Challenge 2: 400 mutations under 6 continuous status readers, 0 bad reads.")
     return True
 
 # ---------------------------------------------------------------------------
@@ -363,20 +330,12 @@ def test_clean_shutdown_and_stale_recovery(sbox):
 
     # 4A: Normal SIGTERM shutdown
     ctx.start()
-    if not os.path.exists(ctx.sock_path) or not os.path.exists(ctx.status_path):
-        print("FAILED: Initial socket or status.json missing")
-        ctx.stop_kill()
-        return False
-
     ret = ctx.stop_term()
     if ret != 0:
         print(f"FAILED: SIGTERM shutdown exited with {ret}")
         return False
     if os.path.exists(ctx.sock_path):
         print(f"FAILED: Socket {ctx.sock_path} was not unlinked on SIGTERM")
-        return False
-    if os.path.exists(ctx.status_path):
-        print(f"FAILED: status.json {ctx.status_path} was not unlinked on SIGTERM")
         return False
 
     # 4B: Normal SIGINT shutdown
@@ -388,23 +347,15 @@ def test_clean_shutdown_and_stale_recovery(sbox):
     if os.path.exists(ctx.sock_path):
         print(f"FAILED: Socket {ctx.sock_path} was not unlinked on SIGINT")
         return False
-    if os.path.exists(ctx.status_path):
-        print(f"FAILED: status.json {ctx.status_path} was not unlinked on SIGINT")
-        return False
 
     # 4C: Stale recovery after SIGKILL
     ctx.start()
-    ctx.stop_kill() # abrupt kill leaves socket and status.json intact
+    ctx.stop_kill() # abrupt kill leaves the socket behind
     if not os.path.exists(ctx.sock_path):
         print("FAILED: Expected stale socket to exist after SIGKILL")
         return False
 
-    # Create stale temporary file to test stale temp file resilience
-    stale_tmp = ctx.status_path + ".tmp.99999"
-    with open(stale_tmp, "w") as f:
-        f.write("stale garbage")
-
-    # Start daemon again over stale socket and stale tmp
+    # Start daemon again over the stale socket
     ctx.start()
     # Query status
     resp = send_cmd(ctx.sock_path, "status\n")
@@ -513,7 +464,7 @@ def main():
     try:
         if not test_rapid_concurrent_status(sbox):
             all_passed = False
-        if not test_atomic_file_updates_under_load(sbox):
+        if not test_status_under_concurrent_mutation(sbox):
             all_passed = False
         if not test_abrupt_disconnects_and_pipelining(sbox):
             all_passed = False

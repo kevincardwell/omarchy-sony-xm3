@@ -90,6 +90,22 @@ public:
     virtual ~IDeviceDiscovery() = default;
     virtual std::vector<BluetoothDeviceInfo> getAvailableDevices() = 0;
     virtual std::optional<BluetoothDeviceInfo> findSonyHeadphones(const std::string& preferredMac = "") = 0;
+
+    // A descriptor that turns readable when BlueZ has something to say, or -1
+    // when there is no way to hear about changes (the caller then polls).
+    [[nodiscard]] virtual int eventFd() const { return -1; }
+    // Reads what arrived. True when a device was connected, disconnected,
+    // paired or unpaired, or BlueZ itself restarted.
+    virtual bool drainEvents() { return false; }
+    // Asks BlueZ to connect or disconnect the device. The answer arrives later
+    // through takeLinkResult().
+    virtual bool setDeviceConnected(const std::string& path, bool connect, std::string& err) {
+        err = "Not supported";
+        return false;
+    }
+    // The outcome of the last setDeviceConnected() once BlueZ has answered:
+    // empty for success, otherwise why it failed. Returned once.
+    virtual std::optional<std::string> takeLinkResult() { return std::nullopt; }
 };
 
 // SDP Resolver abstraction (BlueZ sdp_lib or Mock)
@@ -189,14 +205,27 @@ public:
     bool sendPacket(const uint8_t* data, size_t length);
     bool sendPacket(const std::vector<uint8_t>& packet);
 
+    // Connects or disconnects the headset through BlueZ, as the Bluetooth
+    // menu would. The XM3 holds one host at a time, so disconnecting is also
+    // how it is handed back to a phone.
+    bool requestLink(bool connect, std::string& err);
+
     // Event loop integration (poll/epoll)
     [[nodiscard]] int getPollFd() const;
     [[nodiscard]] short getPollEvents() const;
     void handleSocketEvent(short revents);
+    [[nodiscard]] int getBusFd() const { return discovery_ ? discovery_->eventFd() : -1; }
+    void handleBusEvent();
     void tick();
+    // When tick() next has work to do, if ever. Nothing is due while the
+    // headset is away: a BlueZ signal wakes the loop instead.
+    [[nodiscard]] std::optional<std::chrono::steady_clock::time_point> deadline() const;
 
     // Inspection
     [[nodiscard]] ConnectionState getState() const noexcept { return state_; }
+    [[nodiscard]] bool isPaired() const noexcept { return paired_; }
+    [[nodiscard]] const std::string& linkState() const noexcept { return linkState_; }
+    [[nodiscard]] const std::string& linkError() const noexcept { return linkError_; }
     [[nodiscard]] const BluetoothDeviceInfo& getCurrentDevice() const noexcept { return currentDevice_; }
     [[nodiscard]] uint8_t getCurrentChannel() const noexcept { return currentChannel_; }
     [[nodiscard]] std::string getLastError() const noexcept { return lastError_; }
@@ -207,6 +236,9 @@ private:
     void handleConnectedRead();
     void handleConnectedWrite();
     void scheduleReconnect(const std::string& reason);
+    void waitForBluez(const std::string& reason);
+    void consumeLinkResult();
+    void linkUp();
     void attemptDiscovery();
     void attemptSdp();
     void attemptConnect();
@@ -230,6 +262,13 @@ private:
     uint32_t retryCount_{0};
     std::chrono::steady_clock::time_point lastStateChangeTime_;
     std::chrono::steady_clock::time_point nextReconnectTime_;
+
+    // Logged once per change, not once per attempt.
+    std::string waitReason_;
+    bool paired_{false};
+    std::string linkState_;
+    std::string linkError_;
+    std::chrono::steady_clock::time_point linkDeadline_;
 };
 
 } // namespace omarchy::sony::protocol

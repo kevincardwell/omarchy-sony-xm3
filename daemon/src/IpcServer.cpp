@@ -892,6 +892,16 @@ std::string IpcServer::handleBuiltinCommand(const std::string& line) {
         return "OK\n";
     }
 
+    // connect / disconnect: the Bluetooth link itself. The answer is only that
+    // BlueZ took the request; the outcome shows up in the pushed state.
+    if (verb == "connect" || verb == "disconnect") {
+        std::string err;
+        if (callbacks_.setLink && !callbacks_.setLink(verb == "connect", err)) {
+            return "ERR " + (err.empty() ? "failed to " + verb : err) + "\n";
+        }
+        return "OK\n";
+    }
+
     // raw <hex byte> ... : send an arbitrary payload, for protocol exploration.
     // The headset's reply is logged by the daemon, not returned here.
     if (verb == "raw" || verb == "raw2") {

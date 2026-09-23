@@ -71,7 +71,7 @@ public:
         if (!inFlight_) return;
         if (now - sentAt_ < ackTimeout_) return;
         if (retries_ >= kMaxRetries) {
-            if (log_) fprintf(stderr, "[MDR] No ACK for %s after %d retries; dropping it\n",
+            fprintf(stderr, "[MDR] No ACK for %s after %d retries; dropping it\n",
                     inFlight_->what, kMaxRetries);
             fflush(stderr);
             inFlight_.reset();
@@ -81,6 +81,12 @@ public:
         ++retries_;
         seq_ ^= 1;
         transmit();
+    }
+
+    // When tick() next has to act: the in-flight command's ACK deadline.
+    [[nodiscard]] std::optional<Clock::time_point> deadline() const {
+        if (!inFlight_) return std::nullopt;
+        return sentAt_ + ackTimeout_;
     }
 
     void setLogging(bool enabled) noexcept { log_ = enabled; }

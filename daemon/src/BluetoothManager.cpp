@@ -158,31 +158,83 @@ private:
 
 class DBusDeviceDiscovery : public IDeviceDiscovery {
 public:
-    DBusDeviceDiscovery() = default;
+    DBusDeviceDiscovery() { ensureBus(); }
+
+    ~DBusDeviceDiscovery() override {
+        if (conn_) {
+            dbus_connection_close(conn_);
+            dbus_connection_unref(conn_);
+        }
+    }
+
+    [[nodiscard]] int eventFd() const override {
+        int fd = -1;
+        if (conn_ && dbus_connection_get_is_connected(conn_)) {
+            dbus_connection_get_unix_fd(conn_, &fd);
+        }
+        return fd;
+    }
+
+    bool drainEvents() override {
+        changed_ = false;
+        if (conn_) {
+            dbus_connection_read_write(conn_, 0);
+            dispatchAll();
+        }
+        return changed_;
+    }
+
+    bool setDeviceConnected(const std::string& path, bool connect, std::string& err) override {
+        if (!ensureBus()) {
+            err = "Cannot reach the system D-Bus";
+            return false;
+        }
+        DBusMessage* msg = dbus_message_new_method_call(
+            "org.bluez", path.c_str(), "org.bluez.Device1", connect ? "Connect" : "Disconnect");
+        DBusPendingCall* pending = nullptr;
+        // Paging a headset that is off takes BlueZ several seconds to give up on.
+        const bool sent = msg && dbus_connection_send_with_reply(conn_, msg, &pending, 30000) && pending;
+        if (msg) dbus_message_unref(msg);
+        if (!sent) {
+            err = "Cannot talk to BlueZ";
+            return false;
+        }
+        linkResult_.reset();
+        dbus_pending_call_set_notify(pending, &DBusDeviceDiscovery::onLinkReply, this, nullptr);
+        dbus_pending_call_unref(pending);
+        dbus_connection_flush(conn_);
+        return true;
+    }
+
+    std::optional<std::string> takeLinkResult() override {
+        auto result = std::move(linkResult_);
+        linkResult_.reset();
+        return result;
+    }
 
     std::vector<BluetoothDeviceInfo> getAvailableDevices() override {
         std::vector<BluetoothDeviceInfo> devices;
         DBusError error;
         dbus_error_init(&error);
 
-        DBusConnection* conn = dbus_bus_get(DBUS_BUS_SYSTEM, &error);
-        if (dbus_error_is_set(&error) || !conn) {
-            dbus_error_free(&error);
+        if (!ensureBus()) {
             return devices;
         }
+        DBusConnection* conn = conn_;
 
         DBusMessage* msg = dbus_message_new_method_call(
             "org.bluez", "/", "org.freedesktop.DBus.ObjectManager", "GetManagedObjects");
         if (!msg) {
-            dbus_connection_unref(conn);
             return devices;
         }
 
         DBusMessage* reply = dbus_connection_send_with_reply_and_block(conn, msg, 2000, &error);
         dbus_message_unref(msg);
+        // Signals that arrived while waiting are older than this answer, which
+        // already reflects them; dispatch them so they do not sit in the queue.
+        dispatchAll();
         if (dbus_error_is_set(&error) || !reply) {
             dbus_error_free(&error);
-            dbus_connection_unref(conn);
             return devices;
         }
 
@@ -233,7 +285,6 @@ public:
         }
 
         dbus_message_unref(reply);
-        dbus_connection_unref(conn);
         return devices;
     }
 
@@ -302,6 +353,110 @@ public:
     }
 
 private:
+    // One private connection for the daemon's lifetime: it carries the signal
+    // subscriptions as well as the calls. Reconnected if the bus goes away.
+    bool ensureBus() {
+        if (conn_ && dbus_connection_get_is_connected(conn_)) return true;
+        if (conn_) {
+            dbus_connection_unref(conn_);
+            conn_ = nullptr;
+        }
+        DBusError error;
+        dbus_error_init(&error);
+        conn_ = dbus_bus_get_private(DBUS_BUS_SYSTEM, &error);
+        if (!conn_) {
+            dbus_error_free(&error);
+            return false;
+        }
+        // libdbus would otherwise _exit() the daemon if the system bus drops.
+        dbus_connection_set_exit_on_disconnect(conn_, FALSE);
+        dbus_connection_add_filter(conn_, &DBusDeviceDiscovery::onSignal, this, nullptr);
+        // Only the changes that matter: a device's Connected or Paired flag
+        // (checked in onSignal), and bluetoothd coming or going.
+        dbus_bus_add_match(conn_,
+            "type='signal',sender='org.bluez',interface='org.freedesktop.DBus.Properties',"
+            "member='PropertiesChanged',arg0='org.bluez.Device1'", &error);
+        dbus_error_free(&error);
+        dbus_bus_add_match(conn_,
+            "type='signal',sender='org.freedesktop.DBus',interface='org.freedesktop.DBus',"
+            "member='NameOwnerChanged',arg0='org.bluez'", &error);
+        dbus_error_free(&error);
+        return true;
+    }
+
+    void dispatchAll() {
+        while (conn_ && dbus_connection_dispatch(conn_) == DBUS_DISPATCH_DATA_REMAINS) {}
+    }
+
+    static DBusHandlerResult onSignal(DBusConnection*, DBusMessage* msg, void* data) {
+        auto* self = static_cast<DBusDeviceDiscovery*>(data);
+        if (dbus_message_is_signal(msg, "org.freedesktop.DBus", "NameOwnerChanged")) {
+            self->changed_ = true;
+        } else if (dbus_message_is_signal(msg, "org.freedesktop.DBus.Properties", "PropertiesChanged")) {
+            // (s interface, a{sv} changed, as invalidated): RSSI and the like
+            // change constantly during a scan, so look for the two that matter.
+            DBusMessageIter args, dict;
+            if (dbus_message_iter_init(msg, &args) && dbus_message_iter_next(&args) &&
+                dbus_message_iter_get_arg_type(&args) == DBUS_TYPE_ARRAY) {
+                dbus_message_iter_recurse(&args, &dict);
+                while (dbus_message_iter_get_arg_type(&dict) == DBUS_TYPE_DICT_ENTRY) {
+                    DBusMessageIter entry;
+                    dbus_message_iter_recurse(&dict, &entry);
+                    const char* key = nullptr;
+                    dbus_message_iter_get_basic(&entry, &key);
+                    if (key && (std::strcmp(key, "Connected") == 0 || std::strcmp(key, "Paired") == 0)) {
+                        self->changed_ = true;
+                    }
+                    dbus_message_iter_next(&dict);
+                }
+            }
+        }
+        return DBUS_HANDLER_RESULT_NOT_YET_HANDLED;
+    }
+
+    static void onLinkReply(DBusPendingCall* pending, void* data) {
+        auto* self = static_cast<DBusDeviceDiscovery*>(data);
+        DBusMessage* reply = dbus_pending_call_steal_reply(pending);
+        std::string result;
+        if (!reply) {
+            result = "Bluetooth did not answer";
+        } else if (dbus_message_get_type(reply) == DBUS_MESSAGE_TYPE_ERROR) {
+            result = describeLinkError(dbus_message_get_error_name(reply), reply);
+        }
+        if (reply) dbus_message_unref(reply);
+        self->linkResult_ = result;
+    }
+
+    // BlueZ's errors, in words someone at the panel can act on.
+    static std::string describeLinkError(const char* name, DBusMessage* reply) {
+        const std::string error = name ? name : "";
+        const char* text = nullptr;
+        dbus_message_get_args(reply, nullptr, DBUS_TYPE_STRING, &text, DBUS_TYPE_INVALID);
+        std::string detail = text ? text : "";
+        while (!detail.empty() && std::isspace(static_cast<unsigned char>(detail.back()))) detail.pop_back();
+        std::string lower = detail;
+        std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
+
+        if (error == "org.bluez.Error.AlreadyConnected" || error == "org.bluez.Error.InProgress" ||
+            error == "org.bluez.Error.NotConnected") {
+            return "";
+        }
+        if (error == "org.bluez.Error.NotReady") {
+            return "Bluetooth is off";
+        }
+        if (lower.find("page-timeout") != std::string::npos || lower.find("page timeout") != std::string::npos ||
+            lower.find("host is down") != std::string::npos || lower.find("timed out") != std::string::npos) {
+            return "The headset didn't answer. Switch it on, or disconnect it from your phone first";
+        }
+        return "Bluetooth: " + (detail.empty() ? error : detail);
+    }
+
+    DBusConnection* conn_{nullptr};
+    bool changed_{false};
+    std::optional<std::string> linkResult_;
+
     static void parseDeviceProperties(DBusMessageIter* propsIter, BluetoothDeviceInfo& dev) {
         while (dbus_message_iter_get_arg_type(propsIter) == DBUS_TYPE_DICT_ENTRY) {
             DBusMessageIter propEntryIter, valIter;
@@ -635,25 +790,142 @@ void BluetoothManager::attemptDiscovery() {
     }
 
     auto devOpt = discovery_->findSonyHeadphones(config_.preferredMac);
-    if (!devOpt.has_value()) {
-        scheduleReconnect("No paired WH-1000XM3 found");
+    paired_ = devOpt.has_value() && devOpt->paired;
+    if (!paired_) {
+        waitForBluez("No paired WH-1000XM3 found");
         return;
     }
-
     currentDevice_ = *devOpt;
-    if (!currentDevice_.paired) {
-        scheduleReconnect("Headphone device is not paired");
-        return;
-    }
 
-    // In real mode, if BlueZ reports the device is not connected at the ACL link level,
-    // skip wasteful RFCOMM connection attempts and wait in backoff.
+    // Until BlueZ has the headset connected there is no RFCOMM channel to open,
+    // so wait for it to say so rather than knocking.
     if (!config_.mockMode && !currentDevice_.connected) {
-        scheduleReconnect("Headphones not currently connected via Bluetooth ACL");
+        waitForBluez("Headset is not connected to this computer");
         return;
     }
 
     attemptSdp();
+}
+
+// Nothing can happen until BlueZ reports a change, so nothing is scheduled:
+// the BlueZ signal wakes the event loop. Only without a bus to listen on does
+// this fall back to asking again every few seconds.
+void BluetoothManager::waitForBluez(const std::string& reason) {
+    if (reason != waitReason_) {
+        waitReason_ = reason;
+        fprintf(stderr, "[BT] Waiting: %s\n", reason.c_str());
+        fflush(stderr);
+    }
+    if (discovery_ && discovery_->eventFd() >= 0) {
+        setState(ConnectionState::DISCONNECTED);
+        return;
+    }
+    setState(ConnectionState::RECONNECT_BACKOFF);
+    nextReconnectTime_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(config_.maxBackoffMs);
+}
+
+void BluetoothManager::linkUp() {
+    setState(ConnectionState::CONNECTED);
+    retryCount_ = 0;
+    currentBackoffMs_ = config_.initialBackoffMs;
+    waitReason_.clear();
+    if (linkState_ == "connecting") linkState_.clear();
+    linkError_.clear();
+    if (callbacks_.onConnected) {
+        callbacks_.onConnected();
+    }
+}
+
+bool BluetoothManager::requestLink(bool connect, std::string& err) {
+    if (config_.mockMode) {
+        if (connect) {
+            start();
+        } else if (state_ == ConnectionState::CONNECTED) {
+            transport_->disconnect();
+            sendQueue_.clear();
+            setState(ConnectionState::DISCONNECTED);
+            if (callbacks_.onDisconnected) callbacks_.onDisconnected("Disconnected on request");
+        }
+        return true;
+    }
+
+    auto devOpt = discovery_ ? discovery_->findSonyHeadphones(config_.preferredMac) : std::nullopt;
+    paired_ = devOpt.has_value() && devOpt->paired;
+    if (!paired_) {
+        err = "No paired WH-1000XM3 found. Pair it in the Bluetooth settings first";
+        return false;
+    }
+    currentDevice_ = *devOpt;
+
+    if (connect && currentDevice_.connected) {
+        // BlueZ already has it; only the control channel is missing.
+        if (state_ == ConnectionState::DISCONNECTED || state_ == ConnectionState::RECONNECT_BACKOFF) {
+            attemptDiscovery();
+        }
+        return true;
+    }
+    if (!connect && !currentDevice_.connected) {
+        return true;
+    }
+
+    if (!discovery_->setDeviceConnected(currentDevice_.path, connect, err)) {
+        return false;
+    }
+    fprintf(stderr, "[BT] Asked BlueZ to %s %s\n", connect ? "connect" : "disconnect",
+            currentDevice_.macAddress.c_str());
+    fflush(stderr);
+    linkState_ = connect ? "connecting" : "disconnecting";
+    linkError_.clear();
+    linkDeadline_ = std::chrono::steady_clock::now() + std::chrono::seconds(45);
+    return true;
+}
+
+void BluetoothManager::handleBusEvent() {
+    if (!discovery_) return;
+    const bool changed = discovery_->drainEvents();
+
+    if (discovery_->eventFd() < 0 && state_ == ConnectionState::DISCONNECTED) {
+        // The bus went away while we were waiting on it: poll until it is back.
+        waitForBluez(waitReason_);
+    } else if (changed && (state_ == ConnectionState::DISCONNECTED ||
+                           state_ == ConnectionState::RECONNECT_BACKOFF)) {
+        retryCount_ = 0;
+        currentBackoffMs_ = config_.initialBackoffMs;
+        attemptDiscovery();
+    }
+    consumeLinkResult();
+}
+
+// BlueZ's answer to requestLink(). It can be read here or during any other
+// BlueZ call (a device lookup dispatches whatever arrived with it), so it is
+// collected after both.
+void BluetoothManager::consumeLinkResult() {
+    auto result = discovery_ ? discovery_->takeLinkResult() : std::nullopt;
+    if (!result) return;
+    if (!result->empty()) {
+        fprintf(stderr, "[BT] %s failed: %s\n",
+                linkState_ == "disconnecting" ? "Disconnect" : "Connect", result->c_str());
+        fflush(stderr);
+        linkError_ = *result;
+        linkState_.clear();
+    } else if (linkState_ == "disconnecting") {
+        linkState_.clear();
+    }
+    // A connect that succeeded stays "connecting" until the control channel
+    // is open too, so the panel does not flash "disconnected".
+}
+
+std::optional<std::chrono::steady_clock::time_point> BluetoothManager::deadline() const {
+    std::optional<std::chrono::steady_clock::time_point> due;
+    if (state_ == ConnectionState::CONNECTING) {
+        due = lastStateChangeTime_ + std::chrono::milliseconds(config_.connectTimeoutMs);
+    } else if (state_ == ConnectionState::RECONNECT_BACKOFF && config_.autoReconnect) {
+        due = nextReconnectTime_;
+    }
+    if (!linkState_.empty() && (!due || linkDeadline_ < *due)) {
+        due = linkDeadline_;
+    }
+    return due;
 }
 
 void BluetoothManager::attemptSdp() {
@@ -670,12 +942,11 @@ void BluetoothManager::attemptSdp() {
                                                     config_.sdpTimeoutMs);
         if (ch > 0) {
             currentChannel_ = static_cast<uint8_t>(ch);
-            fprintf(stderr, "[BT] SDP resolved MDR v1 service to RFCOMM channel %d\n", ch);
         } else {
             fprintf(stderr, "[BT] SDP lookup failed; falling back to channel %u\n",
                     (unsigned)currentChannel_);
+            fflush(stderr);
         }
-        fflush(stderr);
     }
 
     attemptConnect();
@@ -688,24 +959,11 @@ void BluetoothManager::attemptConnect() {
         return;
     }
 
-    fprintf(stderr, "[BT] Attempting RFCOMM connect to %s channel %u\n",
-            currentDevice_.macAddress.c_str(), (unsigned)currentChannel_);
-    fflush(stderr);
     int rc = transport_->connect(currentDevice_.macAddress, currentChannel_);
     if (rc == 0) {
-        // Connected immediately
-        fprintf(stderr, "[BT] RFCOMM connected immediately\n");
-        fflush(stderr);
-        setState(ConnectionState::CONNECTED);
-        retryCount_ = 0;
-        currentBackoffMs_ = config_.initialBackoffMs;
-        if (callbacks_.onConnected) {
-            callbacks_.onConnected();
-        }
+        linkUp();
     } else if (rc == 1) {
         // Asynchronous connect in progress, waiting for POLLOUT
-        fprintf(stderr, "[BT] RFCOMM async connect in progress...\n");
-        fflush(stderr);
     } else {
         scheduleReconnect("RFCOMM connect initiation failed: " + transport_->getLastError());
     }
@@ -751,14 +1009,7 @@ void BluetoothManager::handleConnecting(short revents) {
     if (revents & POLLOUT) {
         int err = transport_->checkConnectResult();
         if (err == 0) {
-            fprintf(stderr, "[BT] RFCOMM async connect succeeded\n");
-            fflush(stderr);
-            setState(ConnectionState::CONNECTED);
-            retryCount_ = 0;
-            currentBackoffMs_ = config_.initialBackoffMs;
-            if (callbacks_.onConnected) {
-                callbacks_.onConnected();
-            }
+            linkUp();
         } else {
             scheduleReconnect("Async connect check failed: " + transport_->getLastError());
         }
@@ -829,17 +1080,20 @@ bool BluetoothManager::sendPacket(const std::vector<uint8_t>& packet) {
     return sendPacket(packet.data(), packet.size());
 }
 
+// A connection attempt failed or an open link dropped. Only the drop of an
+// open link is a disconnect; failed attempts just retry with backoff, and only
+// for as long as BlueZ still has the headset (attemptDiscovery checks).
 void BluetoothManager::scheduleReconnect(const std::string& reason) {
+    const bool wasConnected = state_ == ConnectionState::CONNECTED;
     lastError_ = reason;
-    fprintf(stderr, "[BT] Reconnect scheduled: %s\n", reason.c_str());
-    fflush(stderr);
     if (transport_) {
         transport_->disconnect();
     }
     sendQueue_.clear();
     setState(ConnectionState::RECONNECT_BACKOFF);
+    waitReason_.clear();
 
-    if (callbacks_.onDisconnected) {
+    if (wasConnected && callbacks_.onDisconnected) {
         callbacks_.onDisconnected(reason);
     }
 
@@ -853,12 +1107,20 @@ void BluetoothManager::scheduleReconnect(const std::string& reason) {
                  std::pow(config_.backoffMultiplier, std::min(retryCount_, 10u)));
     currentBackoffMs_ = std::min(delay, config_.maxBackoffMs);
     nextReconnectTime_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(currentBackoffMs_);
-    fprintf(stderr, "[BT] Will retry in %u ms (attempt #%u)\n", currentBackoffMs_, retryCount_);
+    fprintf(stderr, "[BT] %s; retrying in %u ms\n", reason.c_str(), currentBackoffMs_);
     fflush(stderr);
 }
 
 void BluetoothManager::tick() {
     auto now = std::chrono::steady_clock::now();
+    consumeLinkResult();
+
+    if (!linkState_.empty() && now >= linkDeadline_) {
+        if (linkState_ == "connecting" && state_ != ConnectionState::CONNECTED) {
+            linkError_ = "The headset connected, but its control channel did not open";
+        }
+        linkState_.clear();
+    }
 
     // Check connect timeout
     if (state_ == ConnectionState::CONNECTING) {

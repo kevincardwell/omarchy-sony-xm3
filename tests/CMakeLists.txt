@@ -15,8 +15,6 @@ endif()
 set(STRESS_TARGETS
     stress_test_protocol
     stress_test_boundary_transport
-    stress_state_engine
-    stress_multi_process
 )
 
 foreach(target IN LISTS STRESS_TARGETS)
@@ -27,13 +25,5 @@ foreach(target IN LISTS STRESS_TARGETS)
             ${CMAKE_SOURCE_DIR}/daemon/src
         )
         add_test(NAME ${target} COMMAND ${target})
-    endif()
-endforeach()
-
-# Multi-process and lifecycle harnesses fork and wait on real sockets, so give
-# them more headroom than CTest's default.
-foreach(target stress_multi_process stress_state_engine)
-    if(TARGET ${target})
-        set_tests_properties(${target} PROPERTIES TIMEOUT 300)
     endif()
 endforeach()

@@ -53,9 +53,9 @@ const Model = new Function(
     defaultStatus, parseStatus, clamp,
     stepToNoiseMode, isVoiceFocusAvailable, cycleNoiseMode,
     dspAvailable, connectionModeName, dseeDescription,
-    EQ_CUSTOM_SLOTS, EQ_BAND_LABELS, NC_BUTTONS, PLAYBACK_ACTIONS,
+    EQ_CUSTOM_SLOTS, EQ_BAND_LABELS, NC_BUTTONS, LINK_STATES,
     isCustomEqSlot, isOptimizerRunning, optimizerDescription, ncButtonName, ncButtonDescription,
-    autoPowerOffLabel, voiceGuidanceDescription, volumeFraction, noiseModeButtonLabel,
+    autoPowerOffLabel, voiceGuidanceDescription, noiseModeButtonLabel, linkSummary, disconnectedHint,
     noiseModeName, noiseModeIcon, eqPresetName, eqPresetButtonLabel,
     surroundName, surroundButtonLabel, soundPositionName,
     batteryIcon, formatBattery, levelFraction, elideError
@@ -182,6 +182,39 @@ suite("Suite 4: Disconnected payload", () => {
   check("disconnected -> not connected", r.connected, false);
   check("disconnected -> battery unknown", r.batteryLevel, Model.LEVEL_UNKNOWN);
   check("disconnected -> no device name", r.deviceName, "");
+  check("disconnected -> paired", r.paired, true);
+
+  // What 0.2.0 sends while the headset is away: enough for the Connect view.
+  const away = Model.parseStatus(JSON.stringify({
+    schema_version: 1, connected: false, paired: true, link_state: "connecting",
+    link_error: "", device_name: "WH-1000XM3", battery_level: 60, noise_mode: "ambient"
+  }));
+  check("away -> last battery kept", away.batteryLevel, 60);
+  check("away -> device name", away.deviceName, "WH-1000XM3");
+  check("away -> link state", away.linkState, "connecting");
+  check("away -> settings ignored while disconnected", away.noiseMode, Model.NOISE_UNKNOWN);
+  const refused = Model.parseStatus(JSON.stringify({
+    schema_version: 1, connected: false, paired: false, link_state: "sideways", link_error: "The headset didn't answer"
+  }));
+  check("refused -> unknown link state dropped", refused.linkState, "");
+  check("refused -> error kept", refused.linkError, "The headset didn't answer");
+  check("refused -> not paired", refused.paired, false);
+  check("legacy aliases are not read", Model.parseStatus(JSON.stringify({
+    schema_version: 1, connected: true, charging: true, dsee: true
+  })).batteryCharging, false);
+});
+
+// ---------------------------------------------------------------------------
+suite("Suite 4b: Link wording", () => {
+  check("daemon down", Model.linkSummary(false, false, "", ""), "Daemon not running");
+  check("connecting", Model.linkSummary(true, false, "connecting", ""), "Connecting…");
+  check("disconnecting", Model.linkSummary(true, true, "disconnecting", "LDAC"), "Disconnecting…");
+  check("connected with codec", Model.linkSummary(true, true, "", "LDAC"), "Connected • LDAC");
+  check("disconnected", Model.linkSummary(true, false, "", ""), "Disconnected");
+  check("hint: not paired", Model.disconnectedHint(true, false, "", -1).indexOf("Pair it") !== -1, true);
+  check("hint: error first", Model.disconnectedHint(true, true, "Bluetooth is off", -1), "Bluetooth is off.");
+  check("hint: last battery", Model.disconnectedHint(true, true, "", 60).indexOf("Battery was 60%") !== -1, true);
+  check("hint: daemon down", Model.disconnectedHint(false, true, "", 60).indexOf("daemon is not running") !== -1, true);
 });
 
 // ---------------------------------------------------------------------------
@@ -236,7 +269,7 @@ suite("Suite 7: Vocabulary shared with the daemon", () => {
   check("auto power off values", Model.AUTO_POWER_OFF_VALUES,
         ["5min", "30min", "60min", "180min", "off"]);
   check("nc button functions", Model.NC_BUTTONS, ["ambient", "google-assistant", "alexa"]);
-  check("playback actions", Model.PLAYBACK_ACTIONS, ["previous", "play", "pause", "next"]);
+  check("link states", Model.LINK_STATES, ["connecting", "disconnecting"]);
   check("connection modes", Model.CONNECTION_MODES, ["quality", "stable"]);
   check("ambient steps start at 2", Model.STEP_AMBIENT_MIN, 2);
   check("default max ambient step", Model.STEP_AMBIENT_MAX_DEFAULT, 19);
@@ -303,8 +336,6 @@ suite("Suite 9: LDAC versus the headset's own processing (observed on hardware)"
 suite("Suite 10: Device features probed from the headset", () => {
   const anc = Model.parseStatus(fixture("status_connected_anc.json"));
   check("firmware version", anc.firmwareVersion, "4.5.2");
-  check("volume", anc.volume, 17);
-  check("volume max", anc.volumeMax, 30);
   check("nc button", anc.ncButton, "ambient");
   check("touch panel", anc.touchPanel, true);
   check("voice guidance", anc.voiceGuidance, true);
@@ -320,10 +351,8 @@ suite("Suite 10: Device features probed from the headset", () => {
   check("custom slot selected", Model.isCustomEqSlot(alt.eqPreset), true);
 
   const bare = Model.parseStatus(JSON.stringify({ schema_version: 1, connected: true }));
-  check("volume unknown when not reported", bare.volume, Model.LEVEL_UNKNOWN);
   check("nc button unknown when not reported", bare.ncButton, "unknown");
-  const wild = Model.parseStatus(JSON.stringify({ schema_version: 1, connected: true, volume: 99, volume_max: 30, nc_button: "siri" }));
-  check("volume clamps to max", wild.volume, 30);
+  const wild = Model.parseStatus(JSON.stringify({ schema_version: 1, connected: true, nc_button: "siri" }));
   check("unknown nc button stays unknown", wild.ncButton, "unknown");
 
   check("custom slots", Model.EQ_CUSTOM_SLOTS, ["custom", "user1", "user2"]);
@@ -344,7 +373,6 @@ suite("Suite 10: Device features probed from the headset", () => {
   check("auto power off labels", Model.AUTO_POWER_OFF_VALUES.map(Model.autoPowerOffLabel), ["5 min", "30 min", "1 hr", "3 hr", "Never"]);
   check("voice guidance on", Model.voiceGuidanceDescription(true, "English"), "Spoken prompts in English");
   check("voice guidance off", Model.voiceGuidanceDescription(false, "English"), "Spoken prompts are off");
-  check("volume fraction", Model.volumeFraction(15, 30), 0.5);
   check("noise button labels", Model.NOISE_MODES.map(Model.noiseModeButtonLabel), ["ANC", "Wind", "Ambient", "Off"]);
 });
 

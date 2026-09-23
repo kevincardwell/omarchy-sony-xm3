@@ -393,8 +393,9 @@ uninstall() {
   "$DEPLOY" remove .local/bin sony-xm3-daemon sony-xm3-ctl
   success "Binaries removed from $HOME/.local/bin/."
 
-  # The daemon keeps status.json (and short-lived status.json.tmp.<pid> files)
-  # in its state directory; only those are removed.
+  # Before 0.2.0 the daemon kept status.json (and short-lived
+  # status.json.tmp.<pid> files) in a state directory. 0.2.0 writes nothing
+  # there, so this only clears what an older version left behind.
   local state_dirs=(".local/state/sony-xm3") dir
   if [[ -n "${XDG_STATE_HOME:-}" && "$XDG_STATE_HOME" == "$HOME"/* &&
         "${XDG_STATE_HOME%/}" != "$HOME/.local/state" ]]; then
