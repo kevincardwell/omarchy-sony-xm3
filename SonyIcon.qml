@@ -3,6 +3,7 @@
 import QtQuick
 import QtQuick.Shapes
 import qs.Commons
+import qs.Commons as Commons
 
 Item {
   id: root
@@ -12,8 +13,8 @@ Item {
   property int batteryLevel: -1
   property bool charging: false
 
-  property color normalColor: Color.foreground
-  property color alertColor: Color.urgent
+  property color normalColor: Commons.Color.foreground
+  property color alertColor: Commons.Color.urgent
   property color chargingColor: "#2ecc71"
   property color disconnectedColor: Qt.rgba(normalColor.r, normalColor.g, normalColor.b, 0.35)
 

@@ -4,6 +4,7 @@ import QtQuick
 import QtQuick.Controls
 import Quickshell.Io
 import qs.Commons
+import qs.Commons as Commons
 import qs.Ui
 import "Model.js" as Model
 
@@ -13,8 +14,8 @@ Panel {
   ipcTarget: "io.github.kevincardwell.omasonyxm3"
   manageIpc: false
 
-  readonly property color foreground: bar ? bar.foreground : Color.foreground
-  readonly property color urgent: bar ? bar.urgent : Color.urgent
+  readonly property color foreground: bar ? bar.foreground : Commons.Color.foreground
+  readonly property color urgent: bar ? bar.urgent : Commons.Color.urgent
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
   readonly property color muted: Qt.darker(root.foreground, 1.4)
 
@@ -246,7 +247,7 @@ Panel {
     property string current: ""
     property int cursor: -1
     property bool active: true
-    property color foreground: Color.foreground
+    property color foreground: Commons.Color.foreground
     property string fontFamily: Style.font.family
     property real fontSize: Style.font.caption
     signal chosen(string value)
@@ -284,7 +285,7 @@ Panel {
     id: headerRow
     property string title: ""
     property string value: ""
-    property color foreground: Color.foreground
+    property color foreground: Commons.Color.foreground
     property string fontFamily: Style.font.family
     height: Math.max(headerTitle.implicitHeight, headerValue.implicitHeight)
 
@@ -317,7 +318,7 @@ Panel {
     property string label: ""
     property int value: 0
     property var barRef: null
-    property color foreground: Color.foreground
+    property color foreground: Commons.Color.foreground
     property string fontFamily: Style.font.family
     signal committed(int value)
     height: bandSlider.implicitHeight > 0 ? Math.max(bandSlider.implicitHeight, bandLabel.implicitHeight) : Style.space(24)
