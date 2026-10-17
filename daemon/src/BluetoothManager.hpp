@@ -158,6 +158,12 @@ public:
     std::optional<BluetoothDeviceInfo> findSonyHeadphones(const std::string& preferredMac = "") override;
 };
 
+// The BlueZ lookup's query half: takes ownership of a connected SDP socket and
+// returns the MDR service's RFCOMM channel, or -1. Bounded by `deadline` and a
+// cap on the peer's total reply bytes. Exposed for tests.
+int querySdpRfcommChannel(int fd, const std::string& uuid,
+                          std::chrono::steady_clock::time_point deadline);
+
 class MockSdpResolver : public ISdpResolver {
 public:
     int channelToReturn{DEFAULT_RFCOMM_CHANNEL};

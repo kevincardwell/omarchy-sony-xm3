@@ -29,7 +29,7 @@ namespace {
 using namespace omarchy::sony;
 using namespace omarchy::sony::protocol;
 
-constexpr const char* DAEMON_VERSION = "0.2.0";
+constexpr const char* DAEMON_VERSION = "0.2.1";
 constexpr const char* DEFAULT_DEVICE_NAME = "WH-1000XM3";
 
 struct DaemonOptions {

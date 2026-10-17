@@ -1537,6 +1537,71 @@ void testDeviceFeatures() {
 }
 
 // ---------------------------------------------------------------------------
+// SDP lookup bounds (fake SDP server on a SEQPACKET socketpair)
+// ---------------------------------------------------------------------------
+// Answers each request with the next of `parts` (attribute-list bytes), marking
+// all but the last as continued. `flood` keeps continuing forever; no parts
+// means never answering. Returns how many replies were sent.
+static int serveSdp(int fd, const std::vector<std::vector<uint8_t>>& parts, bool flood) {
+    uint8_t req[512];
+    int sent = 0;
+    while (::recv(fd, req, sizeof req, 0) >= 5) {
+        if (parts.empty()) continue;
+        size_t i = std::min<size_t>(sent, parts.size() - 1);
+        bool more = flood || i + 1 < parts.size();
+        const auto& a = parts[i];
+        // 0x07 = ServiceSearchAttributeResponse, echoing the request's tid.
+        std::vector<uint8_t> pdu{0x07, req[1], req[2], 0, 0,
+                                 static_cast<uint8_t>(a.size() >> 8), static_cast<uint8_t>(a.size())};
+        pdu.insert(pdu.end(), a.begin(), a.end());
+        if (more) { pdu.push_back(1); pdu.push_back(0x2a); } else { pdu.push_back(0); }
+        pdu[3] = static_cast<uint8_t>((pdu.size() - 5) >> 8);
+        pdu[4] = static_cast<uint8_t>(pdu.size() - 5);
+        if (::send(fd, pdu.data(), pdu.size(), MSG_NOSIGNAL) < 0) break;
+        sent++;
+    }
+    return sent;
+}
+
+void testSdpQueryBounds() {
+    TEST_CASE("SdpQueryBounds");
+    using Clock = std::chrono::steady_clock;
+    int replies = 0;
+    auto run = [&](std::vector<std::vector<uint8_t>> parts, bool flood, int ms) {
+        int sv[2];
+        ::socketpair(AF_UNIX, SOCK_SEQPACKET, 0, sv);
+        std::thread peer([&] { replies = serveSdp(sv[1], parts, flood); });
+        int ch = querySdpRfcommChannel(sv[0], MDR_UUID_V1, Clock::now() + std::chrono::milliseconds(ms));
+        peer.join();  // the query closed sv[0], so the peer reads EOF
+        ::close(sv[1]);
+        return ch;
+    };
+
+    // One record whose ProtocolDescriptorList is { {L2CAP}, {RFCOMM, 15} },
+    // sent in two fragments so the continuation path is exercised.
+    const std::vector<uint8_t> list = {
+        0x35, 0x13, 0x35, 0x11, 0x09, 0x00, 0x04, 0x35, 0x0C,
+        0x35, 0x03, 0x19, 0x01, 0x00,
+        0x35, 0x05, 0x19, 0x00, 0x03, 0x08, 0x0F};
+    TEST_ASSERT_EQ(run({{list.begin(), list.begin() + 8}, {list.begin() + 8, list.end()}}, false, 2000),
+                   15, "channel read from a fragmented record");
+    TEST_ASSERT_EQ(replies, 2, "both fragments consumed");
+
+    auto start = Clock::now();
+    TEST_ASSERT_EQ(run({std::vector<uint8_t>(1000, 0x42)}, true, 5000), -1, "endless continuation fails");
+    TEST_ASSERT(Clock::now() - start < std::chrono::seconds(2), "stopped by the byte cap, not the deadline");
+    TEST_ASSERT(replies > 1 && replies <= 66, "at most ~64 KiB of fragments read");
+
+    start = Clock::now();
+    TEST_ASSERT_EQ(run({}, false, 200), -1, "silent peer fails");
+    auto took = Clock::now() - start;
+    TEST_ASSERT(took >= std::chrono::milliseconds(150) && took < std::chrono::seconds(2),
+                "silent peer ends at the deadline");
+
+    TEST_PASS("SdpQueryBounds");
+}
+
+// ---------------------------------------------------------------------------
 // Main Runner
 // ---------------------------------------------------------------------------
 int main() {
@@ -1561,6 +1626,7 @@ int main() {
     testIpcSocketActivation();
     testCommandQueue();
     testDeviceFeatures();
+    testSdpQueryBounds();
 
     std::cout << "========================================\n";
     std::cout << "Summary: " << (gTotalTests - gFailedTests) << "/" << gTotalTests

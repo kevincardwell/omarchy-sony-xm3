@@ -2,8 +2,8 @@
 
 #include <sys/socket.h>
 #include <sys/poll.h>
+#include <arpa/inet.h>
 #include <unistd.h>
-#include <fcntl.h>
 #include <cerrno>
 #include <cstring>
 #include <algorithm>
@@ -540,11 +540,8 @@ public:
     int resolveRfcommChannel(const std::string& macAddress,
                              const std::string& uuid,
                              uint32_t timeoutMs) override {
-        uint8_t uuidBytes[16];
-        if (parseUuidString(uuid.c_str(), uuidBytes) != 0) {
-            return -1;
-        }
-
+        // Connecting and every round of the query share this one deadline.
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
         bdaddr_t target;
         if (str2ba(macAddress.c_str(), &target) < 0) {
             return -1;
@@ -564,53 +561,83 @@ public:
         };
 
         int poll_rc = ::poll(&pfd, 1, static_cast<int>(timeoutMs));
-        if (poll_rc <= 0 || (pfd.revents & (POLLERR | POLLHUP))) {
-            sdp_close(session);
-            return -1;
-        }
-
-        // Restore blocking mode for SDP query
-        int flags = fcntl(sdp_sock, F_GETFL, 0);
-        if (flags >= 0) {
-            fcntl(sdp_sock, F_SETFL, flags & ~O_NONBLOCK);
-        }
-
-        uuid_t svc_uuid;
-        sdp_uuid128_create(&svc_uuid, uuidBytes);
-
-        sdp_list_t* search_list = sdp_list_append(nullptr, &svc_uuid);
-        uint32_t range = 0x0000ffff;
-        sdp_list_t* attrid_list = sdp_list_append(nullptr, &range);
-        sdp_list_t* response_list = nullptr;
-
-        int status = sdp_service_search_attr_req(
-            session, search_list, SDP_ATTR_REQ_RANGE, attrid_list, &response_list);
-
-        uint8_t channel = 0;
-        if (status == 0 && response_list) {
-            for (sdp_list_t* r = response_list; r; r = r->next) {
-                auto* rec = reinterpret_cast<sdp_record_t*>(r->data);
-                sdp_list_t* proto_list = nullptr;
-                if (sdp_get_access_protos(rec, &proto_list) == 0) {
-                    int p = sdp_get_proto_port(proto_list, RFCOMM_UUID);
-                    if (p > 0 && p <= 30) {
-                        channel = static_cast<uint8_t>(p);
-                    }
-                    sdp_list_free(proto_list, nullptr);
-                    if (channel > 0) break;
-                }
-                sdp_record_free(rec);
-            }
-        }
-
-        if (response_list) sdp_list_free(response_list, nullptr);
-        sdp_list_free(search_list, nullptr);
-        sdp_list_free(attrid_list, nullptr);
+        // The query gets its own copy of the connected socket; sdp_close() closes the original.
+        int fd = (poll_rc > 0 && !(pfd.revents & (POLLERR | POLLHUP))) ? ::dup(sdp_sock) : -1;
         sdp_close(session);
-
-        return channel > 0 ? static_cast<int>(channel) : -1;
+        return fd < 0 ? -1 : querySdpRfcommChannel(fd, uuid, deadline);
     }
 };
+
+// libbluetooth concatenates SDP continuation fragments with no total limit, so
+// every reply PDU is sized from its header before sdp_process() may read it.
+// A real MDR record set is a few hundred bytes.
+constexpr size_t kSdpMaxResponseBytes = 64 * 1024;
+
+int querySdpRfcommChannel(int fd, const std::string& uuid,
+                          std::chrono::steady_clock::time_point deadline) {
+    uint8_t uuidBytes[16];
+    sdp_session_t* session = parseUuidString(uuid.c_str(), uuidBytes) == 0 ? sdp_create(fd, 0) : nullptr;
+    if (!session) {
+        ::close(fd);
+        return -1;
+    }
+
+    struct Result { bool done = false; int channel = -1; } result;
+    sdp_set_notify(session, [](uint8_t type, uint16_t status, uint8_t* rsp, size_t size, void* udata) {
+        auto* r = static_cast<Result*>(udata);
+        r->done = true;
+        if (status != 0 || type != SDP_SVC_SEARCH_ATTR_RSP || !rsp) return;
+
+        uint8_t dtd = 0;
+        int seqlen = 0;
+        int left = static_cast<int>(size);
+        int scanned = sdp_extract_seqtype(rsp, left, &dtd, &seqlen);
+        if (!scanned || !seqlen) return;
+        rsp += scanned;
+        left -= scanned;
+        while (left > 0 && r->channel < 0) {
+            int recsize = 0;
+            sdp_record_t* rec = sdp_extract_pdu(rsp, left, &recsize);
+            if (!rec) break;
+            sdp_list_t* protos = nullptr;
+            if (sdp_get_access_protos(rec, &protos) == 0) {
+                int p = sdp_get_proto_port(protos, RFCOMM_UUID);
+                if (p > 0 && p <= 30) r->channel = p;
+                sdp_list_foreach(protos, reinterpret_cast<sdp_list_func_t>(sdp_list_free), nullptr);
+                sdp_list_free(protos, nullptr);
+            }
+            sdp_record_free(rec);
+            if (recsize <= 0) break;
+            rsp += recsize;
+            left -= recsize;
+        }
+    }, &result);
+
+    uuid_t svcUuid;
+    sdp_uuid128_create(&svcUuid, uuidBytes);
+    uint32_t range = 0x0000ffff;
+    sdp_list_t* search = sdp_list_append(nullptr, &svcUuid);
+    sdp_list_t* attrs = sdp_list_append(nullptr, &range);
+    bool sent = sdp_service_search_attr_async(session, search, SDP_ATTR_REQ_RANGE, attrs) == 0;
+    sdp_list_free(search, nullptr);
+    sdp_list_free(attrs, nullptr);
+
+    size_t received = 0;
+    while (sent && !result.done) {
+        auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - std::chrono::steady_clock::now()).count();
+        struct pollfd pfd{fd, POLLIN, 0};
+        if (left <= 0 || ::poll(&pfd, 1, static_cast<int>(left)) <= 0) break;
+
+        sdp_pdu_hdr_t hdr;
+        if (::recv(fd, &hdr, sizeof hdr, MSG_PEEK) != static_cast<ssize_t>(sizeof hdr)) break;
+        received += sizeof hdr + ntohs(hdr.plen);
+        if (received > kSdpMaxResponseBytes || sdp_process(session) != 0) break;
+    }
+
+    sdp_close(session);
+    return result.channel;
+}
 
 // ---------------------------------------------------------------------------
 // Mock Implementations
