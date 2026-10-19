@@ -382,7 +382,9 @@ int main(int argc, char* argv[]) {
             if (unpacked.type == PacketType::DATA_MDR || unpacked.type == PacketType::DATA_MDR_NO2) {
                 // Reply with ACK packet
                 auto ack = serializeACK(unpacked.seq);
-                btManager->sendPacket(ack);
+                if (!btManager->sendPacket(ack)) {
+                    return; // the link just dropped; the rest is stale
+                }
 
                 if (verboseMdr) {
                     fprintf(stderr, "[DAEMON] RX%s payload (cmd=0x%02x, size=%zu): ",

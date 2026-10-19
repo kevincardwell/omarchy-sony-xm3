@@ -770,6 +770,35 @@ void testMockTransportAndBluetoothManager() {
     TEST_PASS("MockTransportAndBluetoothManager");
 }
 
+// A peer that never reads: the socket buffer fills, then the queue, then the
+// link drops instead of the queue growing.
+void testSendQueueCap() {
+    TEST_CASE("SendQueueCap");
+
+    int peerFd = -1;
+    BluetoothConfig config;
+    config.autoReconnect = false;
+    auto manager = BluetoothManager::createMock(config, &peerFd);
+    std::string reason;
+    BluetoothCallbacks callbacks;
+    callbacks.onDisconnected = [&](const std::string& r) { reason = r; };
+    manager->setCallbacks(callbacks);
+    manager->start();
+    TEST_ASSERT(manager->getState() == ConnectionState::CONNECTED, "mock link up");
+
+    const std::vector<uint8_t> packet(1000, 0x42);
+    size_t accepted = 0;
+    while (accepted < 4 * 1024 * 1024 && manager->sendPacket(packet)) {
+        accepted += packet.size();
+    }
+    TEST_ASSERT(accepted < 4 * 1024 * 1024, "sendPacket stops accepting");
+    TEST_ASSERT(manager->getState() == ConnectionState::DISCONNECTED, "the link is dropped");
+    TEST_ASSERT(reason.find("send queue") != std::string::npos, "dropped for the queue cap");
+    TEST_ASSERT(!manager->sendPacket(packet), "nothing is queued after the drop");
+
+    TEST_PASS("SendQueueCap");
+}
+
 // ---------------------------------------------------------------------------
 // 10. StateEngine and the status JSON
 // ---------------------------------------------------------------------------
@@ -1618,6 +1647,7 @@ int main() {
     testInboundStateParser();
     testStringAndEnumHelpers();
     testMockTransportAndBluetoothManager();
+    testSendQueueCap();
     testStateEngine();
     testBatteryWarning();
     testBluezEvents();

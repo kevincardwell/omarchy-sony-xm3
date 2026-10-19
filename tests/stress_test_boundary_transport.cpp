@@ -459,16 +459,18 @@ void testBluetoothManagerQueueSaturation() {
     manager->start();
     CHK_ASSERT(manager->getState() == ConnectionState::CONNECTED, tName, "Connected");
 
-    // Generate large volume of packets (500 KB total)
+    // Fill the unread socket buffer, then queue 30 KB more (under the 64 KiB cap)
     const size_t kPacketSize = 1000;
-    const size_t kNumPackets = 500;
+    const size_t kQueuedPackets = 30;
     std::vector<uint8_t> singlePacket(kPacketSize, 0x42);
 
     size_t totalBytesQueued = 0;
-    for (size_t i = 0; i < kNumPackets; ++i) {
+    size_t extra = 0;
+    while (extra < kQueuedPackets && totalBytesQueued < 4 * 1024 * 1024) {
         bool ok = manager->sendPacket(singlePacket);
         CHK_ASSERT(ok, tName, "sendPacket must accept or queue packet");
         totalBytesQueued += kPacketSize;
+        if (manager->getPollEvents() & POLLOUT) extra++;
     }
 
     // Since peer socket was not read, socket buffer should have filled and queued the rest

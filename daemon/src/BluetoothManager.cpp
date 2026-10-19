@@ -1077,29 +1077,31 @@ void BluetoothManager::handleConnectedWrite() {
     }
 }
 
+// Every frame the headset sends is ACKed, so a peer that keeps talking while
+// withholding RFCOMM credits would grow the queue without end. Real traffic
+// queues a few frames at most; past the cap the link is dropped.
+constexpr size_t kMaxSendQueueBytes = 64 * 1024;
+
 bool BluetoothManager::sendPacket(const uint8_t* data, size_t length) {
     if (state_ != ConnectionState::CONNECTED || !transport_) {
         return false;
     }
 
+    size_t sent = 0;
     if (sendQueue_.empty()) {
         ssize_t n = transport_->send(data, length);
-        if (n >= 0 && static_cast<size_t>(n) == length) {
-            return true;
+        if (n < 0) {
+            scheduleReconnect("Send error: " + transport_->getLastError());
+            return false;
         }
-        if (n > 0) {
-            sendQueue_.insert(sendQueue_.end(), data + n, data + length);
-            return true;
-        }
-        if (n == 0) {
-            sendQueue_.insert(sendQueue_.end(), data, data + length);
-            return true;
-        }
-        scheduleReconnect("Send error: " + transport_->getLastError());
-        return false;
+        sent = static_cast<size_t>(n);
     }
 
-    sendQueue_.insert(sendQueue_.end(), data, data + length);
+    if (sendQueue_.size() + (length - sent) > kMaxSendQueueBytes) {
+        scheduleReconnect("Headset stopped reading: send queue over 64 KiB");
+        return false;
+    }
+    sendQueue_.insert(sendQueue_.end(), data + sent, data + length);
     return true;
 }
 
