@@ -48,6 +48,11 @@ public:
                 }
             }
         }
+        if (pending_.size() >= kMaxPending) {
+            fprintf(stderr, "[MDR] Command queue full (%zu waiting); dropped %s\n", pending_.size(), what);
+            fflush(stderr);
+            return;
+        }
         // Keep the frame type: table-2 commands (DATA_MDR_NO2) share command
         // bytes with table 1, so the type is what tells them apart.
         pending_.push_back({std::move(unpacked->payload), what, unpacked->type});
@@ -110,6 +115,11 @@ private:
     };
 
     static constexpr int kMaxRetries = 3;
+    // A peer that keeps sending alerts while withholding ACKs would otherwise
+    // grow the queue without end. The connect handshake queues 23 commands;
+    // past this, new ones are dropped. Items are bounded too: a raw IPC payload
+    // fits in a 4 KiB request line, so the whole queue stays well under 1 MiB.
+    static constexpr size_t kMaxPending = 64;
 
     void pump() {
         if (inFlight_ || pending_.empty()) return;

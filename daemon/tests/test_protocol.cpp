@@ -1436,6 +1436,18 @@ void testCommandQueue() {
     q.enqueue(serializeRaw(std::vector<uint8_t>{0x66, 0x02}), "raw packet");
     TEST_ASSERT_EQ(q.queued(), static_cast<size_t>(2), "Non-coalescing commands are all kept");
 
+    // --- A peer that withholds ACKs cannot grow the queue -------------------
+    q.reset();
+    sent.clear();
+    for (int i = 0; i < 10000; ++i) q.enqueue(serializeAlertReply(0x01, false), "alert reply");
+    TEST_ASSERT_EQ(q.queued(), static_cast<size_t>(64), "The queue stops at its cap with no ACKs coming back");
+    q.enqueue(serializeVolume(5), "volume", true);
+    TEST_ASSERT_EQ(q.queued(), static_cast<size_t>(64), "A full queue drops new commands");
+    q.onFrame(PacketType::ACK, 1);
+    TEST_ASSERT_EQ(q.queued(), static_cast<size_t>(63), "An ACK frees a slot");
+    q.enqueue(serializeVolume(5), "volume", true);
+    TEST_ASSERT_EQ(q.queued(), static_cast<size_t>(64), "The freed slot takes a new command");
+
     // --- Reset on disconnect -------------------------------------------------
     q.reset();
     TEST_ASSERT(!q.busy() && q.queued() == 0, "reset() clears everything");
